@@ -1,0 +1,6 @@
+cache/
+output/
+logs/
+__pycache__/
+.pytest_cache/
+tests/test_modes.conf

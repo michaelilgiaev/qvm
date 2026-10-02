@@ -1,0 +1,30 @@
+# pytest configuration for the qvm test suite.
+#
+# The suite is driven by `bash tests.sh` (which builds the venv and sets PYTHONPATH),
+# but this configuration also makes a bare `pytest` invocation work from inside an
+# activated venv: pythonpath below adds qvm's single import root (libraries/) so the
+# flat modules (configuration, checks, ...) resolve without any wrapper. (qvm has only
+# this one root -- unlike azzio, which also carries scripts/libraries.)
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+pythonpath = ["libraries"]
+# -v here is the baseline for a BARE `pytest` run (from an activated venv): every
+# test's node id and PASSED/FAILED on its own line. tests.sh OVERRIDES it per output
+# mode via `-o addopts=` (its mixed/quiet modes want grouped dots, its loud mode wants
+# -vv) -- see tests.sh OUTPUT MODES. So `pytest` alone is verbose, while `bash tests.sh`
+# picks the mode.
+# -p no:cacheprovider disables pytest's cache plugin so .pytest_cache is NEVER created
+# -- not even by a bare `pytest` run outside tests.sh. This repo treats that dir as
+# pollution; killing it at the source beats deleting it afterwards.
+addopts = "-ra -v --strict-markers --import-mode=importlib -p no:cacheprovider"
+# Two markers gate the privileged test tiers; both default OFF (see tests/test_modes.conf
+# and tests/_testmodes.py). --strict-markers is on, so both MUST be declared. conftest.py
+# applies the skips via pytest_collection_modifyitems; flip a tier with `tests.sh
+# --online/--offline` (network) or `tests.sh --user/--root` (root).
+markers = [
+    "network: really pings external hosts; skipped unless the suite is in online mode (default is offline, so a plain run never hangs on DNS). Toggle with tests.sh --online/--offline. Select with -m network, exclude with -m 'not network'.",
+    "root: needs UID 0 to run (loop-mounts a btrfs image); skipped unless the suite is in root mode (default is user). Toggle with tests.sh --root/--user. Selecting the tier does not force root -- the tests self-skip via os.geteuid() when not actually UID 0. Select with -m root, exclude with -m 'not root'.",
+]

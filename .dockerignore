@@ -1,0 +1,7 @@
+output/
+cache/
+logs/
+.git/
+__pycache__/
+.pytest_cache/
+tests/test_modes.conf

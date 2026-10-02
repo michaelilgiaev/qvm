@@ -1,0 +1,10 @@
+qemu-full
+virt-viewer
+edk2-ovmf
+procps-ng
+openssh
+btrfs-progs
+bash-completion
+python
+python-pip
+gcc
