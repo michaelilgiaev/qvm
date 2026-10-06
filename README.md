@@ -9,8 +9,8 @@ Run `qvm` inside a directory and that directory IS the virtual machine: its name
 Documentation only covers Arch-based systems.
 
 ```
-sudo pacman --sync --refresh --needed --noconfirm - < packages_x86_64 \
-    && bash compile.sh \
-    && sudo install -m 755 output/qvm /usr/bin/ \
-    && sudo install -m 644 libraries/completion.bash /usr/share/bash-completion/completions/qvm
+sudo pacman --sync --refresh --needed --noconfirm - < packages_x86_64 && \
+bash compile.sh && \
+sudo install -m 755 output/qvm /usr/bin/ && \
+sudo install -m 644 libraries/completion.bash /usr/share/bash-completion/completions/qvm
 ```
