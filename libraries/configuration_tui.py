@@ -61,19 +61,20 @@ _BOOL_KEYS = {
     "Audio",
 }
 
-_NAV_HINT = " j/k move   enter edit   space toggle   s save   q quit   ? help"
+_NAV_HINT = " arrows/jk move   enter edit   space toggle   s save   q quit   ? help"
 _EDIT_HINT = " editing    enter confirm    esc cancel    Ctrl-U clear"
+_REPLACE_HINT = " type to replace    enter confirm    esc cancel    backspace clear"
 _QUIT_HINT = " Save changes to hypervisor.cfg?   y save    n discard    esc cancel"
 
 _HELP_LINES = (
     "qvm --configure edits hypervisor.cfg in the current directory.",
     "A running VM applies a valid save live, and reverts an invalid file.",
     "",
-    "Up/Down or j/k       move between settings",
-    "Enter or e           edit the selected value",
+    "Up/Down or j/k       move between settings (arrow keys too)",
+    "Enter or e           edit; typing replaces the current value",
     "Space                toggle True/False; cycle Network and Shared",
     "Tab                  cycle Network, otherwise move down",
-    "A digit              start editing a number, percent, or port",
+    "Left/Right           move inside the value being edited",
     "d                    reset the selected setting to its default",
     "s                    save hypervisor.cfg",
     "q                    quit, and ask when there are unsaved edits",
@@ -410,13 +411,16 @@ class Session:
         self.help_scroll = 0
         self.scroll = 0
         self.page = 10
+        # Enter selects the whole value, so the next key replaces it instead of
+        # appending (typing 8192 onto "15%" used to produce the invalid "15%8192").
+        self.replace = False
 
     @property
     def key(self) -> str:
         return configuration_schema.KEYS[self.index]
 
     def on_key(self, key: int) -> "str | None":
-        if curses is not None and key == curses.KEY_RESIZE:
+        if key < 0 or (curses is not None and key == curses.KEY_RESIZE):
             return None
         if self.mode == "help":
             return self._on_help(key)
@@ -434,9 +438,11 @@ class Session:
         if seed is None:
             self.buffer = display_value(self.form.values[self.key])
             self.buf_pos = len(self.buffer)
+            self.replace = True
         else:
             self.buffer = seed
             self.buf_pos = len(seed)
+            self.replace = False
         self.mode = "edit"
         self.status = ""
         self.status_bad = False
@@ -491,6 +497,7 @@ class Session:
     def _on_edit(self, key: int) -> None:
         if key == 27:
             self.mode = "nav"
+            self.replace = False
             self.status = ""
             self.status_bad = False
             return None
@@ -498,11 +505,31 @@ class Session:
             ok, err = self.form.set_value(self.key, self.buffer)
             if ok:
                 self.mode = "nav"
+                self.replace = False
                 self.status = ""
                 self.status_bad = False
             else:
                 self.status = f"{self.key}: {err}"
                 self.status_bad = True
+            return None
+        # The value is selected: the first edit replaces it, like a form field.
+        if self.replace and (_is_backspace(key) or (curses is not None and key == curses.KEY_DC)):
+            self.buffer = ""
+            self.buf_pos = 0
+            self.replace = False
+            return None
+        if self.replace and curses is not None and key == curses.KEY_LEFT:
+            self.buf_pos = 0
+            self.replace = False
+            return None
+        if self.replace and curses is not None and key == curses.KEY_RIGHT:
+            self.buf_pos = len(self.buffer)
+            self.replace = False
+            return None
+        if self.replace and _is_printable(key):
+            self.buffer = chr(key)
+            self.buf_pos = 1
+            self.replace = False
             return None
         if _is_backspace(key):
             if self.buf_pos > 0:
@@ -514,22 +541,28 @@ class Session:
                 self.buffer = self.buffer[: self.buf_pos] + self.buffer[self.buf_pos + 1 :]
             return None
         if curses is not None and key == curses.KEY_LEFT:
+            self.replace = False
             self.buf_pos = max(0, self.buf_pos - 1)
             return None
         if curses is not None and key == curses.KEY_RIGHT:
+            self.replace = False
             self.buf_pos = min(len(self.buffer), self.buf_pos + 1)
             return None
         if key == 1 or (curses is not None and key == curses.KEY_HOME):  # Ctrl-A
             self.buf_pos = 0
+            self.replace = False
             return None
         if key == 5 or (curses is not None and key == curses.KEY_END):  # Ctrl-E
             self.buf_pos = len(self.buffer)
+            self.replace = False
             return None
         if key == 21:  # Ctrl-U
             self.buffer = ""
             self.buf_pos = 0
+            self.replace = False
             return None
         if key == 23:  # Ctrl-W, delete the word before the cursor
+            self.replace = False
             pos = self.buf_pos
             while pos > 0 and self.buffer[pos - 1] == " ":
                 pos -= 1
@@ -740,6 +773,8 @@ def _init_colors() -> bool:
         curses.init_pair(3, curses.COLOR_RED, -1)
         curses.init_pair(4, curses.COLOR_YELLOW, -1)
         curses.init_pair(5, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        # The value selected by Enter, so typing reads as replacing it, not appending.
+        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_YELLOW)
     except curses.error:
         return False
     return True
@@ -842,7 +877,14 @@ def _draw_form(stdscr, session: Session, colors: bool, height: int, width: int) 
             attr |= curses.color_pair(3)
         _put(stdscr, y, 0, f"{marker} {key}".ljust(label_w), attr)
         val_attr = attr
-        if not selected and shown == "True" and colors:
+        if session.mode == "edit" and selected and session.replace:
+            # Paint the whole value, not a cursor at the end of it. The row behind
+            # it stays reversed; this background is what says "the next key replaces".
+            if colors:
+                val_attr = curses.color_pair(6) | curses.A_BOLD
+            else:
+                val_attr = curses.A_UNDERLINE | curses.A_BOLD
+        elif not selected and shown == "True" and colors:
             val_attr |= curses.color_pair(2)
         elif not selected and shown == "False":
             val_attr |= curses.A_DIM
@@ -862,7 +904,7 @@ def _draw_form(stdscr, session: Session, colors: bool, height: int, width: int) 
             _put(stdscr, y, width - 2, "*", star)
 
     if session.mode == "edit":
-        hint = _EDIT_HINT
+        hint = _REPLACE_HINT if session.replace else _EDIT_HINT
     elif session.mode == "quit_ask":
         hint = _QUIT_HINT
     else:
@@ -896,6 +938,109 @@ def _draw_form(stdscr, session: Session, colors: bool, height: int, width: int) 
     stdscr.refresh()
 
 
+def _sequence_complete(parts: list[int]) -> bool:
+    """True when `parts` (the bytes after Esc) is a finished SS3 or CSI sequence.
+
+    A CSI final is 0x40-0x7E, but the introducer `[` itself sits in that range, so
+    the first byte never counts. Cap the length so a stray Esc cannot stall the UI.
+    """
+    if not parts:
+        return False
+    if parts[0] == ord("O"):
+        return len(parts) >= 2
+    if parts[0] == ord("["):
+        if len(parts) >= 16:
+            return True
+        return len(parts) >= 2 and 0x40 <= parts[-1] <= 0x7E
+    return True
+
+
+def _decode_sequence(parts: list[int]) -> int:
+    """Map an SS3 or CSI sequence to a curses key, or -1 when it is not one we use.
+
+    Modified keys (`\\E[1;5B`, ctrl-down) use the letter or the number before `;`.
+    Anything else (F-keys, mouse) is ignored so it cannot land in a value.
+    """
+    if curses is None or not parts:
+        return -1
+    if parts[0] == ord("O") and len(parts) >= 2:
+        return {
+            ord("A"): curses.KEY_UP,
+            ord("B"): curses.KEY_DOWN,
+            ord("C"): curses.KEY_RIGHT,
+            ord("D"): curses.KEY_LEFT,
+            ord("H"): curses.KEY_HOME,
+            ord("F"): curses.KEY_END,
+        }.get(parts[1], -1)
+    if parts[0] != ord("[") or len(parts) < 2:
+        return -1
+    final = parts[-1]
+    number = ""
+    for code in parts[1:-1]:
+        if code == ord(";"):
+            break
+        if ord("0") <= code <= ord("9"):
+            number += chr(code)
+        else:
+            number = ""
+            break
+    if final == ord("~"):
+        return {
+            "1": curses.KEY_HOME,
+            "2": curses.KEY_IC,
+            "3": curses.KEY_DC,
+            "4": curses.KEY_END,
+            "5": curses.KEY_PPAGE,
+            "6": curses.KEY_NPAGE,
+        }.get(number, -1)
+    return {
+        ord("A"): curses.KEY_UP,
+        ord("B"): curses.KEY_DOWN,
+        ord("C"): curses.KEY_RIGHT,
+        ord("D"): curses.KEY_LEFT,
+        ord("H"): curses.KEY_HOME,
+        ord("F"): curses.KEY_END,
+        ord("Z"): curses.KEY_BTAB,
+    }.get(final, -1)
+
+
+def read_key(getch, set_timeout, pending: "list[int] | None" = None) -> int:
+    """One keypress. Arrow keys that curses did not translate still come back as arrows.
+
+    xterm-256color names SS3 arrows (`\\EOA`) and only a few CSI keys. Terminals that
+    ignore keypad mode send CSI (`\\E[A`). curses then returns Esc and leaves `[A` in
+    the queue, and the `A` starts an edit on Network, Shared, Ports, or USB. A bare
+    Esc stays Esc. The byte after it, when it is not the start of a sequence, is kept
+    in `pending` for the next call -- pass the same list every time.
+    """
+    if pending is None:
+        pending = []
+    if pending:
+        return pending.pop(0)
+    key = getch()
+    if key != 27:
+        return key
+    set_timeout(40)
+    try:
+        nxt = getch()
+        if nxt < 0:
+            return 27
+        if nxt not in (ord("["), ord("O")):
+            pending.append(nxt)
+            return 27
+        parts = [nxt]
+        while not _sequence_complete(parts):
+            more = getch()
+            if more < 0:
+                break
+            parts.append(more)
+    finally:
+        set_timeout(-1)
+    if not _sequence_complete(parts):
+        return -1
+    return _decode_sequence(parts)
+
+
 def _loop(stdscr, session: Session) -> None:
     colors = _init_colors()
     stdscr.keypad(True)
@@ -903,9 +1048,11 @@ def _loop(stdscr, session: Session) -> None:
         curses.curs_set(0)
     except curses.error:
         pass
+    # Same list across reads so Esc followed by an ordinary key is not swallowed.
+    pending: list[int] = []
     while True:
         _draw(stdscr, session, colors)
-        key = stdscr.getch()
+        key = read_key(stdscr.getch, stdscr.timeout, pending)
         action = session.on_key(key)
         if action in ("save", "save_quit"):
             ok, message = commit_save(session.form)
@@ -913,6 +1060,7 @@ def _loop(stdscr, session: Session) -> None:
             session.status_bad = not ok
             session.mode = "nav"
             if action == "save_quit" and ok:
+                _draw(stdscr, session, colors)
                 return
         elif action == "quit":
             return

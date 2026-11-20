@@ -5,8 +5,8 @@ defaults surface (`--set` / `--status` / `--reset`) is unchanged and covered in
 test_configuration_hypervisor_defaults.py.
 
 These tests drive Form and Session directly, so the decisions (what is loaded,
-what an edit accepts, what a save rewrites) do not need a terminal. One test at
-the bottom runs the real curses screen on a pty and types into it.
+what an edit accepts, what a save rewrites) do not need a terminal. The tests at
+the bottom run the real curses screen on a pty, including `qvm --configure`.
 """
 
 from __future__ import annotations
@@ -65,8 +65,10 @@ def _session(form, interfaces=None) -> tui.Session:
 
 
 def _select(session, key: str) -> None:
+    target = configuration_schema.KEYS.index(key)
+    step = ord("j") if target >= session.index else ord("k")
     while session.key != key:
-        assert session.on_key(ord("j")) is None
+        assert session.on_key(step) is None
 
 
 # --- load -------------------------------------------------------------------
@@ -201,6 +203,86 @@ def test_invalid_edit_stays_open_and_keeps_the_old_value(tmp_path):
     assert session.status_bad
     assert "RAM" in session.status
     assert form.values["RAM"] == "15%"
+
+
+def test_enter_selects_the_value_so_typing_replaces_it(tmp_path):
+    # Enter used to leave the cursor at the end, so "8192" became "15%8192"
+    # and a path became "False/dev/sdb". The first key now replaces the value.
+    form = _form(tmp_path)
+    session = _session(form)
+    _select(session, "RAM")
+    session.on_key(ord("\n"))
+    assert session.mode == "edit"
+    assert session.replace
+    assert session.buffer == "15%"
+    session.on_key(127)  # backspace clears the selection, it does not nibble one char
+    assert session.buffer == ""
+    assert session.replace is False
+    session.on_key(27)
+
+    session.on_key(ord("\n"))
+    for ch in "8192":
+        session.on_key(ord(ch))
+    assert session.buffer == "8192"
+    assert session.replace is False
+    session.on_key(ord("\n"))
+    assert form.values["RAM"] == "8192"
+
+    _select(session, "Network")
+    session.on_key(ord("\n"))
+    assert session.buffer == "user"
+    for ch in "none":
+        session.on_key(ord(ch))
+    session.on_key(ord("\n"))
+    assert form.values["Network"] == '"none"'
+
+    _select(session, "USB")
+    session.on_key(ord("e"))
+    for ch in "/dev/sdb":
+        session.on_key(ord(ch))
+    session.on_key(ord("\n"))
+    assert form.values["USB"] == '"/dev/sdb"'
+
+
+def test_read_key_decodes_arrows_curses_leaves_in_the_queue():
+    if curses is None:
+        pytest.skip("curses is not available")
+
+    def once(seq, pending=None):
+        data = list(seq)
+        timeouts = []
+
+        def getch():
+            return data.pop(0) if data else -1
+
+        def set_timeout(ms):
+            timeouts.append(ms)
+
+        return tui.read_key(getch, set_timeout, pending), timeouts
+
+    assert once([curses.KEY_UP])[0] == curses.KEY_UP
+    assert once([27, ord("["), ord("B")])[0] == curses.KEY_DOWN
+    assert once([27, ord("O"), ord("B")])[0] == curses.KEY_DOWN
+    assert once([27, ord("["), ord("D")])[0] == curses.KEY_LEFT
+    assert once([27, ord("["), ord("1"), ord(";"), ord("5"), ord("B")])[0] == curses.KEY_DOWN
+    assert once([27, ord("["), ord("3"), ord("~")])[0] == curses.KEY_DC
+    assert once([27, ord("["), ord("Z")])[0] == curses.KEY_BTAB
+    assert once([27, ord("O"), ord("P")])[0] == -1  # F1, not an edit key
+    key, timeouts = once([27])
+    assert key == 27
+    assert timeouts == [40, -1]
+    # A partial CSI is dropped, not replayed as "[".
+    assert once([27, ord("[")])[0] == -1
+
+    pending: list[int] = []
+    data = [27, ord("q")]
+
+    def getch():
+        return data.pop(0) if data else -1
+
+    assert tui.read_key(getch, lambda _ms: None, pending) == 27
+    assert tui.read_key(getch, lambda _ms: None, pending) == ord("q")
+    assert data == []
 
 
 def test_digit_typeahead_replaces_a_number(tmp_path):
@@ -493,16 +575,27 @@ def test_tui_on_a_pty_quit_does_not_touch_the_file(tmp_path):
     assert path.stat().st_mtime_ns == before
 
 
-def _drive_pty(directory, keys: bytes, timeout: float = 5.0) -> tuple[int, str]:
-    """Run configuration_tui.run on a pty, send `keys` once the UI is up, return
-    (exit code, decoded screen). Kills the child if it is still running."""
+def _drive_pty(
+    directory,
+    keys: bytes,
+    timeout: float = 5.0,
+    rows: int = 40,
+    cols: int = 120,
+    cli_entry: bool = False,
+) -> tuple[int, str]:
+    """Run the editor on a pty, send `keys` once the UI is up, return (exit, screen).
+
+    `cli_entry` drives `command_line_interface.main(["--configure"])` with the pty's
+    cwd set to `directory`, which is what `qvm --configure` actually does. The default
+    calls `configuration_tui.run` on that directory. Kills the child if it is still up.
+    """
     import pty
 
     master, slave = pty.openpty()
     proc = None
     buf = b""
     try:
-        winsize = struct.pack("HHHH", 40, 120, 0, 0)
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, winsize)
         env = os.environ.copy()
         env["PYTHONPATH"] = _LIBRARIES
@@ -511,17 +604,28 @@ def _drive_pty(directory, keys: bytes, timeout: float = 5.0) -> tuple[int, str]:
         env.pop("COLUMNS", None)
         env.pop("LINES", None)
         # The editor shortens Esc itself; don't let a parent value surprise it.
-        env.setdefault("ESCDELAY", "25")
-        script = (
-            "import sys, configuration_tui; "
-            "raise SystemExit(configuration_tui.run(sys.argv[1]))"
-        )
+        env["ESCDELAY"] = "25"
+        if cli_entry:
+            script = (
+                "import command_line_interface as cli; "
+                "raise SystemExit(cli.main(['--configure']))"
+            )
+            argv = [sys.executable, "-u", "-c", script]
+            cwd = str(directory)
+        else:
+            script = (
+                "import sys, configuration_tui; "
+                "raise SystemExit(configuration_tui.run(sys.argv[1]))"
+            )
+            argv = [sys.executable, "-u", "-c", script, str(directory)]
+            cwd = None
         proc = subprocess.Popen(
-            [sys.executable, "-c", script, str(directory)],
+            argv,
             stdin=slave,
             stdout=slave,
             stderr=slave,
             env=env,
+            cwd=cwd,
             close_fds=True,
         )
         os.close(slave)
@@ -529,7 +633,7 @@ def _drive_pty(directory, keys: bytes, timeout: float = 5.0) -> tuple[int, str]:
         buf = _read_until(master, b"configure", timeout=timeout)
         if proc.poll() is not None and b"configure" not in buf:
             return proc.returncode, buf.decode("utf-8", "replace")
-        os.write(master, keys)
+        _write_all(master, keys)
         deadline = time.time() + timeout
         while proc.poll() is None and time.time() < deadline:
             ready, _, _ = select.select([master], [], [], 0.1)
@@ -554,6 +658,18 @@ def _drive_pty(directory, keys: bytes, timeout: float = 5.0) -> tuple[int, str]:
         os.close(master)
 
 
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        try:
+            n = os.write(fd, view)
+        except OSError:
+            return
+        if n <= 0:
+            return
+        view = view[n:]
+
+
 def _read_until(master: int, needle: bytes, timeout: float) -> bytes:
     buf = b""
     deadline = time.time() + timeout
@@ -569,3 +685,265 @@ def _read_until(master: int, needle: bytes, timeout: float) -> bytes:
             break
         buf += chunk
     return buf
+
+
+def _visible_screen(data: str, rows: int = 24, cols: int = 80) -> str:
+    """Replay a curses byte stream into a grid, so a failure shows the UI not the escapes."""
+    grid = [[" "] * cols for _ in range(rows)]
+    y = x = 0
+
+    def cup(row: int, col: int) -> None:
+        nonlocal y, x
+        y = max(0, min(rows - 1, row))
+        x = max(0, min(cols - 1, col))
+
+    i = 0
+    n = len(data)
+    while i < n:
+        ch = data[i]
+        if ch == "\x1b" and i + 1 < n and data[i + 1] == "[":
+            i += 2
+            params = ""
+            while i < n and not (0x40 <= ord(data[i]) <= 0x7E):
+                params += data[i]
+                i += 1
+            if i >= n:
+                break
+            final = data[i]
+            i += 1
+            nums = []
+            for part in params.lstrip("?").split(";"):
+                if part.isdigit():
+                    nums.append(int(part))
+            if final in ("H", "f"):
+                cup((nums[0] - 1) if nums else 0, (nums[1] - 1) if len(nums) > 1 else 0)
+            elif final == "d":  # VPA, row only
+                cup((nums[0] - 1) if nums else 0, x)
+            elif final == "G":  # HPA, column only
+                cup(y, (nums[0] - 1) if nums else 0)
+            elif final == "A":
+                cup(y - (nums[0] if nums else 1), x)
+            elif final == "B":
+                cup(y + (nums[0] if nums else 1), x)
+            elif final == "C":
+                cup(y, x + (nums[0] if nums else 1))
+            elif final == "D":
+                cup(y, x - (nums[0] if nums else 1))
+            elif final == "X":
+                for col in range(x, min(cols, x + (nums[0] if nums else 1))):
+                    grid[y][col] = " "
+            elif final == "J" and (not nums or nums[0] == 2):
+                grid = [[" "] * cols for _ in range(rows)]
+                y = x = 0
+            elif final == "K":
+                mode = nums[0] if nums else 0
+                if 0 <= y < rows:
+                    if mode == 0:
+                        for col in range(x, cols):
+                            grid[y][col] = " "
+                    elif mode == 1:
+                        for col in range(0, min(x + 1, cols)):
+                            grid[y][col] = " "
+                    elif mode == 2:
+                        grid[y] = [" "] * cols
+            continue
+        if ch == "\x1b" and i + 1 < n and data[i + 1] == "]":
+            i += 2
+            while i < n and data[i] != "\x07":
+                if data[i] == "\x1b" and i + 1 < n and data[i + 1] == "\\":
+                    i += 2
+                    break
+                i += 1
+            if i < n and data[i] == "\x07":
+                i += 1
+            continue
+        if ch == "\x1b":
+            # ESC ( B / ESC ) 0 are charset shifts. ESC = / ESC > are keypad mode.
+            i += 1
+            if i < n and data[i] in "()":
+                i += 2
+            elif i < n:
+                i += 1
+            continue
+        if ch == "\r":
+            x = 0
+        elif ch == "\n":
+            y = min(rows - 1, y + 1)
+        elif ch == "\b":
+            x = max(0, x - 1)
+        elif ch >= " " and y < rows and x < cols:
+            grid[y][x] = ch
+            x += 1
+        i += 1
+    return "\n".join("".join(row).rstrip() for row in grid).rstrip()
+
+
+def _shown(screen: str, rows: int = 24, cols: int = 80) -> str:
+    return _visible_screen(screen, rows, cols) + "\n---\n" + screen[-1500:]
+
+
+_DOWN = b"\x1b[B"
+_ENTER = b"\r"
+
+
+def _type_value(text: str) -> bytes:
+    """Enter (selects the whole value), the replacement, Enter (confirm)."""
+    return _ENTER + text.encode("ascii") + _ENTER
+
+
+def test_tui_on_a_pty_edits_every_field_with_real_arrow_keys(tmp_path, monkeypatch, capsys):
+    """What a person actually does: Down between rows, Enter, type, save, then `qvm status`."""
+    if curses is None or fcntl is None:
+        pytest.skip("curses is not available")
+    monkeypatch.delenv("HYPERVISOR_VM_NAME", raising=False)
+    path = tmp_path / "hypervisor.cfg"
+    path.write_text("### keep me\nvm_name = codelis-demo\nRAM = 1024\n", encoding="utf-8")
+    actions = {
+        "Share_Host_GPU": b" ",
+        "Network": _type_value("none"),
+        "Shared": _type_value("/mnt/share"),
+        "Clipboard": b" ",
+        "Secure_Shell": b" ",
+        "Ports": _type_value("22:49400"),
+        "Ssh_Forward_Port": _type_value("2222"),
+        "USB": _type_value("/dev/sdb"),
+        "Fullscreen": b" ",
+        "Ask_Before_Quitting_Hypervisor": b" ",
+        "RAM": _type_value("8192"),
+        "CPUs": _type_value("4"),
+        "Disk_Size_GB": _type_value("20%"),
+        "Audio": b" ",
+    }
+    keys = b""
+    last = len(configuration_schema.KEYS) - 1
+    for index, key in enumerate(configuration_schema.KEYS):
+        keys += actions[key]
+        if index != last:
+            keys += _DOWN
+    keys += b"sq"
+    rows, cols = 24, 80
+    rc, screen = _drive_pty(tmp_path, keys, timeout=8.0, rows=rows, cols=cols, cli_entry=True)
+    assert rc == 0, _shown(screen, rows, cols)
+    text = path.read_text(encoding="utf-8")
+    expected = (
+        "### keep me\n"
+        "vm_name = codelis-demo\n"
+        "RAM = 8192\n"
+        "Share_Host_GPU = False\n"
+        'Network = "none"\n'
+        'Shared = "/mnt/share"\n'
+        "Clipboard = True\n"
+        "Secure_Shell = True\n"
+        'Ports = "22:49400"\n'
+        "Ssh_Forward_Port = 2222\n"
+        'USB = "/dev/sdb"\n'
+        "Fullscreen = True\n"
+        "Ask_Before_Quitting_Hypervisor = True\n"
+        "CPUs = 4\n"
+        "Disk_Size_GB = 20%\n"
+        "Audio = False\n"
+    )
+    assert text == expected, _shown(screen, rows, cols)
+    assert "Saved" in screen
+    assert "type to replace" in screen
+    assert "8192" in screen
+
+    hcfg = HypervisorCfg.from_dir(str(tmp_path))
+    assert hcfg.share_host_gpu is False
+    assert hcfg.network == "none"
+    assert hcfg.shared == "/mnt/share"
+    assert hcfg.clipboard is True
+    assert hcfg.secure_shell is True
+    assert hcfg.ports == [(22, 49400)]
+    assert hcfg.ssh_forward_port == 2222
+    assert hcfg.usb == ["/dev/sdb"]
+    assert hcfg.fullscreen is True
+    assert hcfg.ask_before_quitting_hypervisor is True
+    assert hcfg.ram == 8192
+    assert hcfg.cpus == 4
+    assert isinstance(hcfg.disk_size_gb, int) and hcfg.disk_size_gb > 0
+    assert hcfg.audio is False
+
+    again = tui.Form.load(str(tmp_path))
+    assert not again.dirty
+    assert again.values["RAM"] == "8192"
+    assert again.values["Network"] == '"none"'
+    assert again.values["Disk_Size_GB"] == "20%"
+    assert again.values["Ports"] == '"22:49400"'
+
+    monkeypatch.chdir(tmp_path)
+    status_rc = cli.main(["status"])
+    status = capsys.readouterr().out
+    assert status_rc == 0, status
+    assert "codelis-demo" in status
+    assert "Network=none" in status
+    assert "Shared=/mnt/share" in status
+    assert "Secure_Shell=True" in status
+    assert "Ports=22:49400" in status
+    assert "USB=/dev/sdb" in status
+    assert "Share_Host_GPU=False" in status
+    assert "Clipboard=True" in status
+    assert "Fullscreen=True" in status
+    assert "Ask_Before_Quitting_Hypervisor=True" in status
+    assert "RAM=8192" in status
+    assert "CPUs=4" in status
+    assert "Audio=False" in status
+    assert "Disk_Size_GB=" in status
+
+
+def test_tui_on_a_pty_ss3_arrow_moves_before_editing(tmp_path):
+    """Application-cursor mode (the sequence xterm sends after keypad) moves one row."""
+    if curses is None or fcntl is None:
+        pytest.skip("curses is not available")
+    path = tmp_path / "hypervisor.cfg"
+    path.write_text("RAM = 1024\n", encoding="utf-8")
+    # One SS3-down from Share_Host_GPU lands on Network. It must not edit the bool.
+    keys = b"\x1bOB" + _type_value("none") + b"sq"
+    rc, screen = _drive_pty(tmp_path, keys, timeout=8.0, rows=24, cols=80)
+    assert rc == 0, _shown(screen)
+    text = path.read_text(encoding="utf-8")
+    assert 'Network = "none"' in text
+    assert "Share_Host_GPU" not in text
+    assert "RAM = 1024" in text
+
+
+def test_tui_on_a_pty_escape_cancels_an_edit(tmp_path):
+    if curses is None or fcntl is None:
+        pytest.skip("curses is not available")
+    path = tmp_path / "hypervisor.cfg"
+    original = "RAM = 1024\n"
+    path.write_text(original, encoding="utf-8")
+    before = path.stat().st_mtime_ns
+    downs = _DOWN * configuration_schema.KEYS.index("RAM")
+    keys = downs + _ENTER + b"1" + b"\x1b" + b"q"
+    rc, screen = _drive_pty(tmp_path, keys, timeout=8.0, rows=24, cols=80)
+    assert rc == 0, _shown(screen)
+    assert path.read_text(encoding="utf-8") == original
+    assert path.stat().st_mtime_ns == before
+
+
+def test_tui_on_a_pty_invalid_value_is_not_saved(tmp_path):
+    if curses is None or fcntl is None:
+        pytest.skip("curses is not available")
+    path = tmp_path / "hypervisor.cfg"
+    original = "RAM = 1024\n"
+    path.write_text(original, encoding="utf-8")
+    downs = _DOWN * configuration_schema.KEYS.index("RAM")
+    # Enter, replace with garbage, Enter stays in the field, Esc drops it, q leaves.
+    keys = downs + _ENTER + b"lots" + _ENTER + b"\x1b" + b"q"
+    rc, screen = _drive_pty(tmp_path, keys, timeout=8.0, rows=24, cols=80)
+    assert rc == 0, _shown(screen)
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_tui_on_a_pty_left_and_backspace_edit_inside_the_value(tmp_path):
+    if curses is None or fcntl is None:
+        pytest.skip("curses is not available")
+    path = tmp_path / "hypervisor.cfg"
+    path.write_text("RAM = 1024\n", encoding="utf-8")
+    downs = _DOWN * configuration_schema.KEYS.index("RAM")
+    # 8192, then Left onto the last digit, Backspace removes the 9 -> 812.
+    keys = downs + _ENTER + b"8192" + b"\x1b[D" + b"\x7f" + _ENTER + b"sq"
+    rc, screen = _drive_pty(tmp_path, keys, timeout=8.0, rows=24, cols=80)
+    assert rc == 0, _shown(screen)
+    assert "RAM = 812" in path.read_text(encoding="utf-8")
