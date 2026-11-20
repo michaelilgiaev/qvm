@@ -1,8 +1,9 @@
 """command_line_interface.py - argument parsing, usage text, and the dispatch entry point.
 
-This file parses args and calls into virtual_machine.py (the per-directory subcommands)
-or configuration_defaults.py (the global `--configure` defaults surface); all the real
-logic lives in the other modules.
+This file parses args and calls into virtual_machine.py (the per-directory subcommands),
+configuration_tui.py (`qvm --configure`, the terminal UI for this directory's
+hypervisor.cfg), or configuration_defaults.py (the global `--configure --set/--status/
+--reset` defaults surface). All the real logic lives in the other modules.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import configuration  # noqa: E402  (after the sys.path bootstrap above)
 import configuration_defaults  # noqa: E402
 import configuration_schema  # noqa: E402
+import configuration_tui  # noqa: E402
 import virtual_machine as vm  # noqa: E402
 from checks import HypervisorError  # noqa: E402
 from configuration import Config, DEFAULT_SSH_FORWARD_PORT  # noqa: E402
@@ -58,9 +60,12 @@ USAGE:
   qvm status                 Show VM name, files, running state, SSH port, toggles.
   qvm stop [PID|NAME]        Power a VM off. No argument stops THIS dir's VM; a PID or
                              VM name (from `ls`) stops any running VM from anywhere.
-  qvm --configure [--status | --set KEY VALUE | --reset]
+  qvm --configure            Edit THIS directory's hypervisor.cfg in a
+                             terminal UI. Save writes the file; a running
+                             VM applies valid edits live.
+  qvm --configure --status | --set KEY VALUE | --reset
                              Manage the GLOBAL defaults every NEW `qvm install`
-                             starts from (this dir's own hypervisor.cfg still wins).
+                             starts from (this directory's hypervisor.cfg wins).
   qvm help                   This text.
 
 hypervisor.cfg keys (all settings live here -- edit freely; True/False, strings quoted;
@@ -103,10 +108,11 @@ def main(argv: list[str] | None = None) -> int:
     rest = argv[1:]
 
     try:
-        # `--configure` edits the GLOBAL user defaults (~/.config/azzio-hypervisor);
-        # it is NOT a per-directory VM action, so it runs BEFORE Config.from_cwd() and
-        # works from anywhere (an empty dir with no disk/iso would make from_cwd resolve
-        # a VM that does not exist). Mirrors `azzio backup --configure`.
+        # Bare `--configure` opens the terminal UI for THIS directory's hypervisor.cfg.
+        # `--status` / `--set` / `--reset` edit the GLOBAL user defaults
+        # (~/.config/azzio-hypervisor) and are not per-directory VM actions, so the
+        # whole `--configure` family runs BEFORE Config.from_cwd() and works from
+        # anywhere (an empty dir has no disk yet; the UI creates hypervisor.cfg on save).
         if cmd in ("--configure", "-c", "configure"):
             return _do_configure(rest)
 
@@ -143,11 +149,13 @@ def main(argv: list[str] | None = None) -> int:
 def _configure_usage() -> str:
     keys = ", ".join(configuration_schema.KEYS)
     return (
-        "Usage: qvm --configure --status\n"
+        "Usage: qvm --configure\n"
+        "       qvm --configure --status\n"
         "       qvm --configure --set KEY VALUE\n"
         "       qvm --configure --reset\n\n"
-        "Manage the GLOBAL defaults every NEW `qvm install` starts from\n"
-        "(stored in " + configuration_defaults.defaults_path() + ").\n"
+        "With no option, open a terminal UI for THIS directory's hypervisor.cfg.\n\n"
+        "The options below manage the GLOBAL defaults every NEW `qvm install`\n"
+        "starts from (stored in " + configuration_defaults.defaults_path() + ").\n"
         "A directory's own hypervisor.cfg still wins for that VM.\n\n"
         "  --status         print the effective defaults (built-in + your overrides)\n"
         "  --set KEY VALUE  validate VALUE and save it as the default for KEY\n"
@@ -157,13 +165,18 @@ def _configure_usage() -> str:
 
 
 def _do_configure(rest: list[str]) -> int:
-    """The `qvm --configure` surface: manage the global default overrides. Returns an
-    exit code. Non-interactive (the bare-`azzio` TUI drives --set/--status/--reset); mirrors
-    `azzio backup --configure`. Never raises HypervisorError -- it validates via the schema
-    and reports its own errors so a bad --set is a clean non-zero exit, not a traceback."""
-    if not rest or rest[0] in ("-h", "--help", "help"):
+    """`qvm --configure`: a terminal UI for this directory's hypervisor.cfg, or (with
+    an option) the global default overrides. Returns an exit code.
+
+    Bare `--configure` is the interactive editor. `--set` / `--status` / `--reset`
+    stay non-interactive so the bare-`azzio` TUI can drive them; they mirror
+    `azzio backup --configure`. A bad --set is a clean non-zero exit, not a traceback.
+    """
+    if not rest:
+        return configuration_tui.run()
+    if rest[0] in ("-h", "--help", "help"):
         print(_configure_usage())
-        return 0 if rest else 2
+        return 0
 
     opt = rest[0]
     if opt == "--status":

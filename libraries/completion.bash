@@ -74,8 +74,16 @@ _qvm_complete() {
             COMPREPLY=( $(compgen -f -- "$cur") )
             return 0
             ;;
+        --configure|configure|-c)
+            # Bare `--configure` is the terminal UI (no argument). The global-defaults
+            # options are the only words worth offering at the next position.
+            if [ "$cword" -eq 2 ]; then
+                COMPREPLY=( $(compgen -W "--status --set --reset --help -h" -- "$cur") )
+            fi
+            return 0
+            ;;
         *)
-            # ls / status / help / --configure take no positional we can complete.
+            # ls / status / help take no positional we can complete.
             return 0
             ;;
     esac
