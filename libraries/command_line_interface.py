@@ -83,10 +83,11 @@ a running VM applies edits live where it can, and reverts a file with an invalid
                                   until that same proxy forwards again. False:
                                   with the proxies file, try 10 at a time, keep
                                   the fastest that carries two connections at
-                                  once, and save the other working ones. A lost
-                                  proxy switches to the next saved one. The
-                                  certificate has to be real. A handshake alone
-                                  is not enough.
+                                  once, and save the other working ones. A guest
+                                  connection that fails or goes silent drops
+                                  that proxy immediately and tries the next
+                                  ones. The certificate has to be real. A
+                                  handshake alone is not enough.
   Shared                          False | True (this dir) | an absolute host path
                                   to share into the guest via virtiofs
   Clipboard                       share the clipboard host<->guest (SPICE vdagent)
@@ -166,7 +167,9 @@ def _configure_usage() -> str:
         "       qvm --configure --status\n"
         "       qvm --configure --set KEY VALUE\n"
         "       qvm --configure --reset\n\n"
-        "With no option, open a terminal UI for THIS directory's hypervisor.cfg.\n\n"
+        "With no option, open a terminal UI for THIS directory's hypervisor.cfg.\n"
+        "While a VM is running there, p shows the proxy (latency, country, exit\n"
+        "address, saved standbys) and n switches to the next proxy immediately.\n\n"
         "The options below manage the GLOBAL defaults every NEW `qvm install`\n"
         "starts from (stored in " + configuration_defaults.defaults_path() + ").\n"
         "A directory's own hypervisor.cfg still wins for that VM.\n\n"

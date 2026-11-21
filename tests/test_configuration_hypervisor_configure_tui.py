@@ -73,6 +73,56 @@ def _select(session, key: str) -> None:
 
 # --- load -------------------------------------------------------------------
 
+def test_p_opens_proxy_details_and_n_asks_for_the_next_proxy(tmp_path):
+    session = _session(_form(tmp_path))
+    assert session.on_key(ord("p")) is None
+    assert session.mode == "proxy"
+    assert session.on_key(ord("n")) == "proxy_next"
+    assert session.on_key(27) is None
+    assert session.mode == "nav"
+
+
+def test_proxy_screen_reads_the_running_session(tmp_path):
+    status = {
+        "running": True,
+        "current": {
+            "url": "socks5://203.0.113.8:1080",
+            "latency_ms": 180,
+            "country": "DE",
+            "country_name": "Germany",
+            "exit_ip": "203.0.113.8",
+            "colo": "FRA",
+            "state": "durable",
+            "uptime_s": 42,
+            "ok": 9,
+            "fail": 0,
+        },
+        "standbys": [{
+            "url": "http://198.51.100.9:8080",
+            "latency_ms": 240,
+            "country": "US",
+            "country_name": "United States",
+            "exit_ip": "198.51.100.9",
+            "colo": "EWR",
+        }],
+        "note": "",
+    }
+    (tmp_path / "proxy.status").write_text(
+        __import__("json").dumps(status), encoding="utf-8",
+    )
+    lines = tui._proxy_lines(str(tmp_path))
+    text = "\n".join(lines)
+    assert "socks5://203.0.113.8:1080" in text
+    assert "180 ms" in text
+    assert "Germany" in text
+    assert "203.0.113.8" in text
+    assert "durable" in text
+    assert "up 42s" in text
+    assert "9 ok" in text
+    assert "http://198.51.100.9:8080" in text
+    assert "United States" in text
+
+
 def test_missing_file_shows_defaults_and_writes_nothing(tmp_path):
     form = _form(tmp_path)
     assert form.existed is False

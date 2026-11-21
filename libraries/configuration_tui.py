@@ -23,6 +23,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import configuration  # noqa: E402
 import configuration_schema  # noqa: E402
+import proxy_config  # noqa: E402
 from checks import HypervisorError  # noqa: E402
 
 try:
@@ -37,7 +38,7 @@ FIELD_HELP = {
     "Share_Host_GPU": "Guest uses the host GPU (shared, not passthrough). False = software GPU.",
     "Network": '"user" (NAT), "none", or a host interface. Space cycles the choices.',
     "Proxy": 'False, True (the proxies file, one URL per line), or a socks4://, socks5://, or http:// URL.',
-    "Proxy_Kill_Switch": "Cut the guest's internet when the proxy drops. Off tries 10 at a time, keeps the fastest whose certificate checks out, and saves the other working ones.",
+    "Proxy_Kill_Switch": "Cut the guest's internet when the proxy drops. Off tries 10 at a time, keeps the fastest whose certificate checks out, and drops a proxy as soon as a guest connection fails.",
     "Shared": "False, True (this directory), or an absolute host path shared via virtiofs.",
     "Clipboard": "Share the clipboard between the host and the guest (SPICE vdagent).",
     "Secure_Shell": "Forward the guest SSH port to the host.",
@@ -64,7 +65,8 @@ _BOOL_KEYS = {
     "Proxy_Kill_Switch",
 }
 
-_NAV_HINT = " arrows/jk move   enter edit   space toggle   s save   q quit   ? help"
+_NAV_HINT = " arrows/jk move   enter edit   space toggle   p proxy   s save   q quit   ? help"
+_PROXY_HINT = " n next proxy    j/k scroll    esc back"
 _EDIT_HINT = " editing    enter confirm    esc cancel    Ctrl-U clear"
 _REPLACE_HINT = " type to replace    enter confirm    esc cancel    backspace clear"
 _QUIT_HINT = " Save changes to hypervisor.cfg?   y save    n discard    esc cancel"
@@ -72,6 +74,9 @@ _QUIT_HINT = " Save changes to hypervisor.cfg?   y save    n discard    esc canc
 _HELP_LINES = (
     "qvm --configure edits hypervisor.cfg in the current directory.",
     "A running VM applies a valid save live, and reverts an invalid file.",
+    "While that VM is running, p shows each proxy's health: latency, country,",
+    "exit address, uptime, and how many checks it passed or failed.",
+    "The fastest measured proxy is used. n switches to the next fastest saved one.",
     "",
     "Up/Down or j/k       move between settings (arrow keys too)",
     "Enter or e           edit; typing replaces the current value",
@@ -79,6 +84,8 @@ _HELP_LINES = (
     "Tab                  cycle Network, otherwise move down",
     "Left/Right           move inside the value being edited",
     "d                    reset the selected setting to its default",
+    "p                    proxy details for the VM running in this directory",
+    "n                    on that screen, switch to the next proxy now",
     "s                    save hypervisor.cfg",
     "q                    quit, and ask when there are unsaved edits",
     "?                    this help",
@@ -417,6 +424,7 @@ class Session:
         # Enter selects the whole value, so the next key replaces it instead of
         # appending (typing 8192 onto "15%" used to produce the invalid "15%8192").
         self.replace = False
+        self.proxy_scroll = 0
 
     @property
     def key(self) -> str:
@@ -431,7 +439,23 @@ class Session:
             return self._on_quit_ask(key)
         if self.mode == "edit":
             return self._on_edit(key)
+        if self.mode == "proxy":
+            return self._on_proxy(key)
         return self._on_nav(key)
+
+    def _on_proxy(self, key: int) -> "str | None":
+        if key in (27, ord("q"), ord("Q")):
+            self.mode = "nav"
+            return None
+        if key in (ord("n"), ord("N")):
+            return "proxy_next"
+        if _is_down(key):
+            self.proxy_scroll += 1
+            return None
+        if _is_up(key):
+            self.proxy_scroll = max(0, self.proxy_scroll - 1)
+            return None
+        return None
 
     def _move(self, delta: int) -> None:
         last = len(configuration_schema.KEYS) - 1
@@ -632,6 +656,11 @@ class Session:
             shown = display_value(self.form.values[self.key])
             self.status = f"{self.key} reset to default ({shown})."
             return None
+        if key in (ord("p"), ord("P")):
+            self.mode = "proxy"
+            self.proxy_scroll = 0
+            self.status = ""
+            return None
         if key == ord("?"):
             self.mode = "help"
             self.help_scroll = 0
@@ -805,7 +834,93 @@ def _draw(stdscr, session: Session, colors: bool) -> None:
     if session.mode == "help":
         _draw_help(stdscr, session, colors, height, width)
         return
+    if session.mode == "proxy":
+        _draw_proxy(stdscr, session, colors, height, width)
+        return
     _draw_form(stdscr, session, colors, height, width)
+
+
+def _proxy_fact(item: dict) -> str:
+    """One line of health: state, uptime, successes, failures, latency, country."""
+    latency = item.get("latency_ms")
+    latency_text = "n/a" if latency is None else f"{latency} ms"
+    state = item.get("state") or "unproven"
+    up = item.get("uptime_s")
+    ok = item.get("ok")
+    fail = item.get("fail")
+    country = item.get("country_name") or item.get("country") or "unknown"
+    parts = [state, latency_text, country]
+    if up:
+        parts.append(f"up {up}s")
+    if ok is not None:
+        parts.append(f"{ok} ok")
+    if fail:
+        parts.append(f"{fail} fail")
+    return "  ".join(str(part) for part in parts)
+
+
+def _proxy_lines(directory: str) -> list[str]:
+    """Lines for the proxy screen. No session means the VM is not running here."""
+    status = proxy_config.read_proxy_status(directory)
+    if not status or not status.get("running"):
+        return [
+            "No proxy session is running in this directory.",
+            "Start the VM with qvm run, then press p again.",
+        ]
+    lines = ["Proxy in use"]
+    current = status.get("current") or {}
+    if not current:
+        lines.append("  still choosing")
+    else:
+        lines.append(f"  {current.get('url') or ''}")
+        lines.append(f"  {_proxy_fact(current)}")
+        exit_ip = current.get("exit_ip") or ""
+        colo = current.get("colo") or ""
+        if exit_ip or colo:
+            lines.append(f"  exit {exit_ip or 'n/a'}    colo {colo or 'n/a'}")
+    lines.append("")
+    lines.append("Saved proxies, fastest first")
+    standbys = status.get("standbys") or []
+    if not standbys:
+        lines.append("  none yet")
+    for item in standbys:
+        lines.append(f"  {_proxy_fact(item)}")
+        lines.append(f"    {item.get('url') or ''}")
+    failed = status.get("failed") or []
+    if failed:
+        lines.append("")
+        lines.append("Failed checks")
+        for item in failed:
+            lines.append(f"  {_proxy_fact(item)}")
+            lines.append(f"    {item.get('url') or ''}")
+    note = status.get("note") or ""
+    if note:
+        lines.append("")
+        lines.append(note)
+    return lines
+
+
+def _draw_proxy(stdscr, session: Session, colors: bool, height: int, width: int) -> None:
+    _bar(stdscr, 0, " qvm  proxy", _title_attr(colors))
+    lines = _proxy_lines(session.form.directory)
+    if session.status:
+        lines.append("")
+        lines.append(session.status)
+    top = 2
+    visible = max(1, height - 3)
+    max_scroll = max(0, len(lines) - visible)
+    session.proxy_scroll = max(0, min(session.proxy_scroll, max_scroll))
+    for row in range(visible):
+        index = session.proxy_scroll + row
+        if index >= len(lines):
+            break
+        _put(stdscr, top + row, 1, _clip(lines[index], width - 2))
+    _bar(stdscr, height - 1, _PROXY_HINT, _hint_attr(colors))
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.refresh()
 
 
 def _draw_help(stdscr, session: Session, colors: bool, height: int, width: int) -> None:
@@ -1054,9 +1169,20 @@ def _loop(stdscr, session: Session) -> None:
     # Same list across reads so Esc followed by an ordinary key is not swallowed.
     pending: list[int] = []
     while True:
+        # A short wait redraws the proxy screen while the VM is running.
+        stdscr.timeout(250)
         _draw(stdscr, session, colors)
         key = read_key(stdscr.getch, stdscr.timeout, pending)
         action = session.on_key(key)
+        if action == "proxy_next":
+            try:
+                proxy_config.request_next_proxy(session.form.directory)
+                session.status = "Switching to the next proxy."
+                session.status_bad = False
+            except OSError as exc:
+                session.status = f"Could not switch: {exc.strerror or exc}"
+                session.status_bad = True
+            continue
         if action in ("save", "save_quit"):
             ok, message = commit_save(session.form)
             session.status = message

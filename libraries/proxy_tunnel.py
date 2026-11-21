@@ -57,7 +57,10 @@ def _socks5_auth(sock: socket.socket, username: str, password: str) -> None:
     speaks is down. One that answers inside the window is up, however slow.
     """
     previous = sock.gettimeout()
-    sock.settimeout(proxy_config.PROBE_TIMEOUT_S)
+    # A guest dial already put a short budget on the socket. Do not stretch it
+    # back to the canary window, or a dead proxy blocks the guest for seconds.
+    if previous is None:
+        sock.settimeout(proxy_config.PROBE_TIMEOUT_S)
     try:
         if username:
             sock.sendall(b"\x05\x02\x00\x02")
@@ -175,19 +178,23 @@ def http_connect(
 
 
 def open_tunnel(
-    proxy: ProxyEndpoint, host: str, port: int, timeout: float = 20.0
+    proxy: ProxyEndpoint, host: str, port: int, timeout: float = 20.0,
+    connect_timeout: "float | None" = None,
 ) -> socket.socket:
     """Connect to `proxy` and return a socket whose stream is host:port.
 
     The caller owns the socket. On any failure the socket is closed and the
     error propagates -- a half-open proxy socket must not be relayed.
     """
-    # The connect budget is the probe window, not `timeout`. `timeout` covers
-    # the destination the proxy dials after it has answered. A connect that
-    # finishes inside the window keeps this proxy; how long it took does not.
+    # The connect budget is the probe window, not `timeout`, unless the caller
+    # is a guest dial that has already decided this proxy is out of time.
+    # `timeout` covers the destination the proxy dials after it has answered.
+    connect_budget = (
+        proxy_config.PROBE_TIMEOUT_S if connect_timeout is None else connect_timeout
+    )
     try:
         sock = socket.create_connection(
-            (proxy.host, proxy.port), timeout=proxy_config.PROBE_TIMEOUT_S,
+            (proxy.host, proxy.port), timeout=connect_budget,
         )
     except OSError as exc:
         raise ProxyDown(f"proxy is not answering: {exc}") from exc
@@ -218,7 +225,23 @@ def _proves_forwarding(payload: bytes) -> bool:
     return b"cloudflare" in payload.lower()
 
 
-def _read_http_proof(sock: socket.socket, timeout: float) -> bool:
+def _trace_fields(payload: bytes) -> dict:
+    """`loc`, `ip`, and `colo` from a Cloudflare trace body. Empty when absent."""
+    _head, _sep, body = payload.partition(b"\r\n\r\n")
+    source = body if _sep else payload
+    fields: dict[str, str] = {}
+    for line in source.splitlines():
+        if b"=" not in line or line.lower().startswith(b"http"):
+            continue
+        key, _, value = line.partition(b"=")
+        fields[key.decode("latin1", "replace").strip()] = value.decode(
+            "latin1", "replace"
+        ).strip()
+    return fields
+
+
+def _read_http_proof(sock: socket.socket, timeout: float) -> "dict | None":
+    """Trace fields when the reply is really from the canary, else None."""
     host = proxy_config.CANARY_HOST
     request = (
         f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\n"
@@ -231,13 +254,15 @@ def _read_http_proof(sock: socket.socket, timeout: float) -> bool:
         try:
             chunk = sock.recv(1024)
         except TimeoutError:
-            return False
+            break
         if not chunk:
             break
         data += chunk
-        if _proves_forwarding(bytes(data)):
-            return True
-    return _proves_forwarding(bytes(data))
+        if _proves_forwarding(bytes(data)) and b"loc=" in data and b"ip=" in data:
+            break
+    if not _proves_forwarding(bytes(data)):
+        return None
+    return _trace_fields(bytes(data))
 
 
 def _tls_context() -> ssl.SSLContext:
@@ -253,14 +278,13 @@ def _tls_context() -> ssl.SSLContext:
     return ctx
 
 
-def proxy_forwards(proxy: ProxyEndpoint, timeout: float) -> bool:
-    """True only when `proxy` carries two verified HTTPS replies at once.
+def probe_details(proxy: ProxyEndpoint, timeout: float) -> "dict | None":
+    """Trace fields when `proxy` carries two verified HTTPS replies at once.
 
-    Both tunnels have to finish TLS to the canary and the certificate has to
-    verify. A proxy that substitutes its own certificate is False, the same
-    as one that accepts TCP and then stays silent, refuses the destination,
-    or resets the second connection. The canary host, port, and CA are read
-    here, not at import.
+    None unless both tunnels finish TLS to the canary and the certificate
+    checks out. A proxy that substitutes its own certificate is None, the
+    same as one that accepts TCP and then stays silent. `loc`, `ip`, and
+    `colo` come from the trace body when the canary sends them.
     """
     host = proxy_config.CANARY_HOST
     port = int(proxy_config.CANARY_PORT)
@@ -275,12 +299,16 @@ def proxy_forwards(proxy: ProxyEndpoint, timeout: float) -> bool:
             # handshake, or a proxy that accepts and then says nothing hangs.
             raw.settimeout(timeout)
             secure.append(ctx.wrap_socket(raw, server_hostname=host))
+        first: dict | None = None
         for sock in secure:
-            if not _read_http_proof(sock, timeout):
-                return False
-        return True
+            fields = _read_http_proof(sock, timeout)
+            if not fields:
+                return None
+            if first is None:
+                first = fields
+        return first or {}
     except OSError:
-        return False
+        return None
     finally:
         for sock in secure:
             try:
@@ -292,6 +320,11 @@ def proxy_forwards(proxy: ProxyEndpoint, timeout: float) -> bool:
                 sock.close()
             except OSError:
                 pass
+
+
+def proxy_forwards(proxy: ProxyEndpoint, timeout: float) -> bool:
+    """True only when `proxy` carries two verified HTTPS replies at once."""
+    return probe_details(proxy, timeout) is not None
 
 
 def proxy_reachable(proxy: ProxyEndpoint, timeout: float) -> bool:

@@ -13,8 +13,10 @@ what a lost proxy means:
              carries two verified HTTPS replies at once is kept. The others
              that also carry them are saved and used, in that speed order,
              when the current one stops. A handshake alone is not enough, and
-             neither is a proxy that substitutes its own certificate. A proxy
-             that still returns data is not replaced because another is faster.
+             neither is a proxy that substitutes its own certificate. A guest
+             connection that fails or goes silent abandons that proxy at once
+             and tries the next ones. A canary that still answers does not
+             keep a proxy the guest cannot use.
 
 This module is pure: it reads a file only in load_plan(), and the failover
 decision takes a clock reading instead of sleeping. The network namespace that
@@ -23,6 +25,7 @@ actually carries guest packets lives in proxy_runtime.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -31,8 +34,123 @@ from dataclasses import dataclass
 # how long that connect may take. A connect that finishes inside the window is
 # a live proxy no matter how slow it was. A refused connection fails at once.
 # The window is long enough that one slow reply is not mistaken for a dead proxy.
-PROBE_EVERY_S = 1.0
-PROBE_TIMEOUT_S = 8.0
+PROBE_EVERY_S = 0.4
+PROBE_TIMEOUT_S = 1.2
+
+# A guest dial does not get the canary's patience. One proxy has this long to
+# finish the tunnel and to send the first byte. After that it is abandoned and
+# the next proxies are tried together.
+GUEST_DIAL_TIMEOUT_S = 0.6
+
+# The running VM writes this beside hypervisor.cfg. `qvm --configure` reads it.
+# `proxy.cmd` is how that screen asks the running VM to switch now.
+STATUS_NAME = "proxy.status"
+CMD_NAME = "proxy.cmd"
+
+# A proxy is responsive when its latest check finished inside this window.
+# It is durable after this many successes in a row, spanning at least DURABLE_S
+# with no failure in between. One lucky reply is not a durable proxy.
+RESPONSIVE_S = 0.8
+DURABLE_OK = 3
+DURABLE_S = 8.0
+
+
+@dataclass(frozen=True)
+class ProxyRecord:
+    """What repeated checks have learned about one proxy."""
+
+    ok_count: int = 0
+    fail_count: int = 0
+    streak_ok: int = 0
+    streak_fail: int = 0
+    streak_since: "float | None" = None
+    last_ok: "float | None" = None
+    last_fail: "float | None" = None
+    latency: "float | None" = None
+
+
+def note_health(
+    record: ProxyRecord, *, ok: bool, now: float, latency: "float | None" = None,
+) -> ProxyRecord:
+    """Fold one check into `record`. A failure ends the current uptime streak."""
+    if ok:
+        since = record.streak_since if record.streak_ok else now
+        return ProxyRecord(
+            ok_count=record.ok_count + 1,
+            fail_count=record.fail_count,
+            streak_ok=record.streak_ok + 1,
+            streak_fail=0,
+            streak_since=since,
+            last_ok=now,
+            last_fail=record.last_fail,
+            latency=record.latency if latency is None else latency,
+        )
+    return ProxyRecord(
+        ok_count=record.ok_count,
+        fail_count=record.fail_count + 1,
+        streak_ok=0,
+        streak_fail=record.streak_fail + 1,
+        streak_since=None,
+        last_ok=record.last_ok,
+        last_fail=now,
+        latency=record.latency,
+    )
+
+
+def health_label(record: "ProxyRecord | None", now: float) -> str:
+    """`durable`, `responsive`, `slow`, `down`, or `unproven`.
+
+    Durable means it has kept answering, quickly, for DURABLE_S. Responsive
+    means the latest answer was quick but the streak is still short. Slow
+    answers. Down means the latest check failed.
+    """
+    if record is None or (record.ok_count == 0 and record.fail_count == 0):
+        return "unproven"
+    failed_last = record.streak_fail > 0 and (
+        record.last_ok is None or (record.last_fail or 0) >= (record.last_ok or 0)
+    )
+    if failed_last:
+        return "down"
+    latency = record.latency
+    quick = latency is not None and latency <= RESPONSIVE_S
+    up = 0.0 if record.streak_since is None else max(0.0, now - record.streak_since)
+    if record.streak_ok >= DURABLE_OK and up >= DURABLE_S and quick:
+        return "durable"
+    if record.streak_ok >= 1 and quick:
+        return "responsive"
+    if record.streak_ok >= 1:
+        return "slow"
+    return "down"
+
+
+def health_rank(label: str) -> int:
+    """Label order for display. Selection uses latency, not this rank."""
+    return {"durable": 0, "responsive": 1, "slow": 2, "unproven": 3, "down": 4}.get(label, 5)
+
+
+def selection_key(record: "ProxyRecord | None", now: float) -> tuple:
+    """Sort key for which proxy carries the guest. Lower wins.
+
+    A proxy whose latest check failed sorts last. Every other proxy sorts by
+    its latest latency, so the fastest measured one is first. Durability is
+    reported, and it does not outrank a faster reply.
+    """
+    label = health_label(record, now)
+    latency = None if record is None else record.latency
+    return (1 if label == "down" else 0, latency if latency is not None else 1e9)
+
+
+def should_promote(current_s: "float | None", candidate_s: "float | None") -> bool:
+    """True when `candidate_s` is fast enough to replace the proxy in use.
+
+    Fifty milliseconds of noise does not move the guest. A clearly faster
+    measurement does.
+    """
+    if candidate_s is None:
+        return False
+    if current_s is None:
+        return True
+    return candidate_s + 0.05 < current_s
 
 # How many proxies from a proxies file are proved together when none is pinned.
 # The whole group is started before one is chosen. The first proxy that
@@ -227,6 +345,67 @@ def _plan_from_file(directory: str, name: str) -> ProxyPlan:
     if not endpoints:
         raise ValueError(f"{name}: no proxy URLs")
     return ProxyPlan(True, True, name, tuple(endpoints))
+
+
+# ISO 3166-1 alpha-2 names for the country code on Cloudflare's trace page.
+_COUNTRIES = {
+    "AD": "Andorra", "AE": "United Arab Emirates", "AF": "Afghanistan",
+    "AG": "Antigua and Barbuda", "AL": "Albania", "AM": "Armenia", "AR": "Argentina",
+    "AT": "Austria", "AU": "Australia", "AZ": "Azerbaijan", "BA": "Bosnia and Herzegovina",
+    "BD": "Bangladesh", "BE": "Belgium", "BG": "Bulgaria", "BH": "Bahrain",
+    "BR": "Brazil", "BY": "Belarus", "CA": "Canada", "CH": "Switzerland",
+    "CL": "Chile", "CN": "China", "CO": "Colombia", "CR": "Costa Rica",
+    "CY": "Cyprus", "CZ": "Czechia", "DE": "Germany", "DK": "Denmark",
+    "DO": "Dominican Republic", "DZ": "Algeria", "EC": "Ecuador", "EE": "Estonia",
+    "EG": "Egypt", "ES": "Spain", "FI": "Finland", "FR": "France", "GB": "United Kingdom",
+    "GE": "Georgia", "GR": "Greece", "GT": "Guatemala", "HK": "Hong Kong",
+    "HR": "Croatia", "HU": "Hungary", "ID": "Indonesia", "IE": "Ireland",
+    "IL": "Israel", "IN": "India", "IQ": "Iraq", "IR": "Iran", "IS": "Iceland",
+    "IT": "Italy", "JP": "Japan", "KE": "Kenya", "KG": "Kyrgyzstan", "KH": "Cambodia",
+    "KR": "South Korea", "KW": "Kuwait", "KZ": "Kazakhstan", "LB": "Lebanon",
+    "LT": "Lithuania", "LU": "Luxembourg", "LV": "Latvia", "MA": "Morocco",
+    "MD": "Moldova", "MX": "Mexico", "MY": "Malaysia", "NG": "Nigeria",
+    "NL": "Netherlands", "NO": "Norway", "NP": "Nepal", "NZ": "New Zealand",
+    "PA": "Panama", "PE": "Peru", "PH": "Philippines", "PK": "Pakistan",
+    "PL": "Poland", "PT": "Portugal", "QA": "Qatar", "RO": "Romania",
+    "RS": "Serbia", "RU": "Russia", "SA": "Saudi Arabia", "SE": "Sweden",
+    "SG": "Singapore", "SI": "Slovenia", "SK": "Slovakia", "TH": "Thailand",
+    "TR": "Turkey", "TW": "Taiwan", "UA": "Ukraine", "US": "United States",
+    "UY": "Uruguay", "UZ": "Uzbekistan", "VE": "Venezuela", "VN": "Vietnam",
+    "ZA": "South Africa",
+}
+
+
+def country_name(code: str) -> str:
+    """English name for a trace `loc=` code. Unknown codes come back unchanged."""
+    cleaned = (code or "").strip().upper()
+    if not cleaned:
+        return ""
+    return _COUNTRIES.get(cleaned, cleaned)
+
+
+def read_proxy_status(directory: str) -> "dict | None":
+    """The running VM's proxy.status, or None when no session has published one."""
+    path = os.path.join(directory, STATUS_NAME)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.loads(fh.read())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def request_next_proxy(directory: str) -> None:
+    """Ask the running VM in `directory` to drop the current proxy now."""
+    path = os.path.join(directory, CMD_NAME)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("next\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
 
 
 def describe(plan: ProxyPlan, kill_switch: bool) -> str:

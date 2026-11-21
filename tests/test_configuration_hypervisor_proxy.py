@@ -59,6 +59,7 @@ def _make_canary_material(directory: Path, name: str) -> tuple[str, str, str]:
             "-days", "2", "-subj", f"/CN=qvm-{name}-ca",
             "-addext", "basicConstraints=critical,CA:TRUE",
             "-addext", "keyUsage=keyCertSign,cRLSign",
+            "-addext", "subjectKeyIdentifier=hash",
         ],
         check=True, capture_output=True,
     )
@@ -69,6 +70,7 @@ def _make_canary_material(directory: Path, name: str) -> tuple[str, str, str]:
     leaf_ext.write_text(
         "subjectAltName=IP:1.1.1.1\nbasicConstraints=CA:FALSE\n"
         "keyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n"
+        "subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n"
     )
     subprocess.run(
         [
@@ -294,6 +296,43 @@ def test_note_probe_does_not_rotate_a_single_url_or_without_a_file():
 def test_note_probe_success_clears_the_down_timer():
     state, action = _probe(HealthState(1, 50.0, False), ok=True, now=60)
     assert action == "none" and state.down_since is None and state.index == 1 and not state.killed
+
+
+def test_the_fastest_proxy_sorts_ahead_of_a_slower_durable_one():
+    """Latency picks the proxy. A long uptime does not beat a faster reply."""
+    now = 100.0
+    quick = proxy_config.ProxyRecord(
+        ok_count=1, streak_ok=1, streak_since=now, last_ok=now, latency=0.12,
+    )
+    durable = proxy_config.ProxyRecord()
+    for at in (10.0, 12.0, 10.0 + proxy_config.DURABLE_S):
+        durable = proxy_config.note_health(durable, ok=True, now=at, latency=0.7)
+    assert proxy_config.health_label(durable, 10.0 + proxy_config.DURABLE_S) == "durable"
+    assert proxy_config.selection_key(quick, now) < proxy_config.selection_key(durable, now)
+    assert proxy_config.should_promote(0.7, 0.12) is True
+    assert proxy_config.should_promote(0.20, 0.18) is False
+    assert proxy_config.should_promote(None, 0.2) is True
+    assert proxy_config.should_promote(0.2, None) is False
+
+
+def test_health_label_requires_a_streak_before_a_proxy_is_durable():
+    """One fast reply is responsive. Durable takes repeated quick successes."""
+    record = proxy_config.ProxyRecord()
+    assert proxy_config.health_label(record, 0) == "unproven"
+    record = proxy_config.note_health(record, ok=True, now=10, latency=0.2)
+    assert proxy_config.health_label(record, 10) == "responsive"
+    assert proxy_config.health_rank("durable") < proxy_config.health_rank("responsive")
+    record = proxy_config.note_health(record, ok=True, now=12, latency=0.3)
+    record = proxy_config.note_health(record, ok=True, now=10 + proxy_config.DURABLE_S, latency=0.3)
+    assert record.streak_ok >= proxy_config.DURABLE_OK
+    assert proxy_config.health_label(record, 10 + proxy_config.DURABLE_S) == "durable"
+    slow = proxy_config.note_health(
+        proxy_config.ProxyRecord(), ok=True, now=1, latency=proxy_config.RESPONSIVE_S + 1,
+    )
+    assert proxy_config.health_label(slow, 1) == "slow"
+    down = proxy_config.note_health(record, ok=False, now=100)
+    assert proxy_config.health_label(down, 100) == "down"
+    assert down.streak_ok == 0 and down.fail_count == 1 and down.ok_count == record.ok_count
 
 
 def test_public_dns_target_rewrites_private_resolvers():
@@ -538,6 +577,8 @@ class _Proxy:
         *,
         mitm: bool = False,
         cleartext: bool = False,
+        reject_guest: bool = False,
+        blackhole_guest: bool = False,
     ):
         self.scheme = scheme
         self.accept_delay = accept_delay
@@ -545,6 +586,8 @@ class _Proxy:
         self.blackhole = blackhole
         self.mitm = mitm
         self.cleartext = cleartext
+        self.reject_guest = reject_guest
+        self.blackhole_guest = blackhole_guest
         self.seen: list[tuple[str, int]] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -632,7 +675,18 @@ class _Proxy:
                 return
             with self._lock:
                 self.seen.append(dest)
-            if self.refuse:
+            if self.refuse or (
+                self.reject_guest and not (
+                    dest[0] == proxy_config.CANARY_HOST
+                    and int(dest[1]) == int(proxy_config.CANARY_PORT)
+                )
+            ):
+                return
+            if self.blackhole_guest and not (
+                dest[0] == proxy_config.CANARY_HOST
+                and int(dest[1]) == int(proxy_config.CANARY_PORT)
+            ):
+                self._swallow(conn)
                 return
             if self.blackhole:
                 # Handshake is done and the destination is recorded. No payload
@@ -673,7 +727,11 @@ class _Proxy:
         else:
             return None
         port = struct.unpack("!H", _recvall(conn, 2))[0]
-        if self.refuse:
+        canary = (
+            host == proxy_config.CANARY_HOST
+            and port == int(proxy_config.CANARY_PORT)
+        )
+        if self.refuse or (self.reject_guest and not canary):
             conn.sendall(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
         else:
             conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
@@ -1015,6 +1073,191 @@ def test_a_slower_working_proxy_is_saved_and_used_when_the_fastest_dies(
             session.close()
         fast.close()
         slow.close()
+
+
+def test_a_saved_proxy_that_stops_answering_is_marked_down(tmp_path, monkeypatch):
+    """Standbys are checked again. One that goes quiet leaves the saved list."""
+    monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 0.05)
+    monkeypatch.setattr(proxy_config, "PROBE_TIMEOUT_S", 0.4)
+    monkeypatch.setattr(proxy_config, "DURABLE_S", 0.2)
+    monkeypatch.setattr(proxy_config, "DURABLE_OK", 2)
+    fast = _Proxy("http")
+    slow = _Proxy("socks5", accept_delay=0.05)
+    session = None
+    try:
+        one = fast.start()
+        two = slow.start()
+        (tmp_path / "proxies").write_text(
+            f"http://127.0.0.1:{one}\n"
+            f"socks5://127.0.0.1:{two}\n",
+            encoding="utf-8",
+        )
+        session = _boot(tmp_path, fast, kill=False, source="proxies")
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        _wait(
+            lambda: any(key[2] == two for _latency, key in session._working),
+            5,
+            "the second proxy was not saved",
+        )
+        slow.stop()
+        _wait(
+            lambda: not any(key[2] == two for _latency, key in session._working),
+            5,
+            "the dead standby was kept",
+        )
+        status = proxy_config.read_proxy_status(str(tmp_path))
+        assert status is not None
+        assert status["current"]["url"] == f"http://127.0.0.1:{one}"
+        assert status["current"]["ok"] >= 2
+        assert status["current"]["state"] in ("responsive", "durable")
+        failed = " ".join(item["url"] for item in status.get("failed") or [])
+        assert f"127.0.0.1:{two}" in failed
+    finally:
+        if session is not None:
+            session.close()
+        fast.close()
+        slow.close()
+
+
+def test_a_faster_saved_proxy_replaces_the_one_in_use(tmp_path, monkeypatch):
+    """Background promotion moves the guest when a saved proxy is clearly faster."""
+    monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 30)
+    monkeypatch.setattr(proxy_config, "PROBE_TIMEOUT_S", 2.0)
+    fast = _Proxy("http")
+    slow = _Proxy("socks5", accept_delay=0.05)
+    session = None
+    try:
+        one = fast.start()
+        two = slow.start()
+        (tmp_path / "proxies").write_text(
+            f"http://127.0.0.1:{one}\n"
+            f"socks5://127.0.0.1:{two}\n",
+            encoding="utf-8",
+        )
+        session = _boot(tmp_path, fast, kill=False, source="proxies")
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        _wait(
+            lambda: any(key[2] == two for _latency, key in session._working),
+            5,
+            "the second proxy was not saved",
+        )
+        assert session.index == 0
+        # The proxy in use has gone slow. The saved one measured faster.
+        session._remember_working(session._endpoints[0], 1.5)
+        session._remember_working(session._endpoints[1], 0.08)
+        session._promote_fastest()
+        assert session.index == 1
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        assert ("203.0.113.10", 80) in slow.seen
+    finally:
+        if session is not None:
+            session.close()
+        fast.close()
+        slow.close()
+
+
+def test_configure_can_switch_to_the_next_saved_proxy(tmp_path, monkeypatch):
+    """The configure screen's next-proxy command pins a saved proxy at once."""
+    monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 30)
+    monkeypatch.setattr(proxy_config, "PROBE_TIMEOUT_S", 2.0)
+    fast = _Proxy("http")
+    slow = _Proxy("socks5", accept_delay=0.1)
+    session = None
+    try:
+        one = fast.start()
+        two = slow.start()
+        (tmp_path / "proxies").write_text(
+            f"http://127.0.0.1:{one}\n"
+            f"socks5://127.0.0.1:{two}\n",
+            encoding="utf-8",
+        )
+        session = _boot(tmp_path, fast, kill=False, source="proxies")
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        _wait(
+            lambda: any(key[2] == two for _latency, key in session._working),
+            5,
+            "the second proxy was not saved",
+        )
+        status = proxy_config.read_proxy_status(str(tmp_path))
+        assert status is not None and status["running"] is True
+        assert status["current"]["url"] == f"http://127.0.0.1:{one}"
+        assert status["current"]["latency_ms"] is not None
+        proxy_config.request_next_proxy(str(tmp_path))
+        _wait(lambda: session.index == 1, 2, "next proxy was not applied")
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        assert ("203.0.113.10", 80) in slow.seen
+    finally:
+        if session is not None:
+            session.close()
+        fast.close()
+        slow.close()
+
+
+def test_a_proxy_that_refuses_the_guest_is_abandoned_for_the_next(
+    tmp_path, monkeypatch,
+):
+    """The canary can succeed while every real guest destination is refused.
+
+    That proxy is not kept. The same guest connection is carried by the next
+    one, without waiting for a later health probe.
+    """
+    monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 30)
+    monkeypatch.setattr(proxy_config, "PROBE_TIMEOUT_S", 2.0)
+    bad = _Proxy("socks5", reject_guest=True)
+    good = _Proxy("http", accept_delay=0.2)
+    session = None
+    try:
+        one = bad.start()
+        two = good.start()
+        (tmp_path / "proxies").write_text(
+            f"socks5://127.0.0.1:{one}\nhttp://127.0.0.1:{two}\n",
+            encoding="utf-8",
+        )
+        session = _boot(tmp_path, bad, kill=False, source="proxies")
+        started = time.monotonic()
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        assert time.monotonic() - started < 3.0
+        assert session.index == 1
+        assert ("203.0.113.10", 80) in good.seen
+    finally:
+        if session is not None:
+            session.close()
+        bad.close()
+        good.close()
+
+
+def test_a_silent_proxy_is_dropped_when_the_guest_gets_no_reply(
+    tmp_path, monkeypatch,
+):
+    """A tunnel that accepts and then sends nothing is not a working proxy."""
+    monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 30)
+    monkeypatch.setattr(proxy_config, "PROBE_TIMEOUT_S", 2.0)
+    bad = _Proxy("socks5", blackhole_guest=True)
+    good = _Proxy("http", accept_delay=0.15)
+    session = None
+    try:
+        one = bad.start()
+        two = good.start()
+        (tmp_path / "proxies").write_text(
+            f"socks5://127.0.0.1:{one}\nhttp://127.0.0.1:{two}\n",
+            encoding="utf-8",
+        )
+        session = _boot(tmp_path, bad, kill=False, source="proxies")
+        started = time.monotonic()
+        got = b""
+        for _ in range(4):
+            got = _guest(session, tmp_path, _PING)
+            if got == b"pong":
+                break
+        assert got == b"pong"
+        assert time.monotonic() - started < 8.0
+        assert session.index == 1
+        assert ("203.0.113.10", 80) in good.seen
+    finally:
+        if session is not None:
+            session.close()
+        bad.close()
+        good.close()
 
 
 def test_a_dead_proxy_fails_over_inside_the_dial(tmp_path, monkeypatch):

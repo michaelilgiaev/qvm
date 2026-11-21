@@ -21,8 +21,10 @@ at a time. The whole group is started together. The one that first carries two
 verified HTTPS replies is the fastest, and it is kept. Every other proxy in
 that group that also carries them is saved, slowest last, and used in that
 order when the current one stops forwarding. A handshake that never sends a
-payload is not a win, a substituted certificate is not a win, and a later
-connection does not shop for a faster one while the current one still works.
+payload is not a win, and a substituted certificate is not a win. A guest
+connection that fails, times out, or gets no reply abandons that proxy at
+once and the next ones are tried together. Open sockets are not treated as
+proof that the proxy still works.
 
 Host port forwards (SSH and Ports) are published back on the host: QEMU binds
 them inside the namespace, and a unix socket bridges the host listener to that
@@ -47,7 +49,7 @@ import time
 import proxy_config
 import proxy_tunnel
 from checks import die
-from proxy_config import HealthState, ProxyEndpoint, ProxyPlan
+from proxy_config import HealthState, ProxyEndpoint, ProxyPlan, ProxyRecord
 
 _CLONE_NEWUSER = 0x10000000
 _CLONE_NEWNET = 0x40000000
@@ -128,24 +130,17 @@ def _recv_fd(sock: socket.socket) -> tuple[bytes, "int | None"]:
     return data, got
 
 
-def _transient_down(exc: BaseException) -> bool:
-    """A reset right after a good canary is not the same as a dead proxy.
-
-    "Not answering" is a timeout or a refused connection: the proxy is gone.
-    An early close can be the proxy frowning at a second socket it just served.
-    """
-    return "not answering" not in str(exc).lower()
-
-
 def _open_guest_tunnel(proxy: ProxyEndpoint, host: str, port: int) -> socket.socket:
-    """Dial `proxy`. Retry one reset before the caller treats the proxy as dead."""
-    try:
-        return proxy_tunnel.open_tunnel(proxy, host, port)
-    except proxy_tunnel.ProxyDown as exc:
-        if not _transient_down(exc):
-            raise
-        time.sleep(0.2)
-        return proxy_tunnel.open_tunnel(proxy, host, port)
+    """Dial `proxy` for one guest destination. The budget is short on purpose.
+
+    A proxy that cannot finish this tunnel inside it is abandoned. Retrying
+    the same one, or waiting out the canary window, is what left the guest
+    with no internet while the next proxy sat unused.
+    """
+    budget = proxy_config.GUEST_DIAL_TIMEOUT_S
+    return proxy_tunnel.open_tunnel(
+        proxy, host, port, timeout=budget, connect_timeout=budget,
+    )
 
 
 class _Bag:
@@ -198,10 +193,18 @@ class _Bag:
             return len(self._socks)
 
 
-def _relay(left: socket.socket, right: socket.socket, bag: "_Bag | None" = None) -> None:
+def _relay(
+    left: socket.socket, right: socket.socket, bag: "_Bag | None" = None,
+    on_stall=None,
+) -> None:
     """Copy bytes both ways until either side closes. Returns immediately; the
-    pumps are daemon threads so a guest connection cannot pin the supervisor."""
-    state = {"left": True, "right": True}
+    pumps are daemon threads so a guest connection cannot pin the supervisor.
+
+    `right` is the proxy side when `on_stall` is set. If that side sends
+    nothing within the guest budget, the tunnel is closed and `on_stall`
+    runs. A handshake that then stays silent is not a working proxy.
+    """
+    state = {"left": True, "right": True, "proxy": False}
     gate = threading.Lock()
 
     def pump(src: socket.socket, dst: socket.socket, which: str) -> None:
@@ -210,6 +213,8 @@ def _relay(left: socket.socket, right: socket.socket, bag: "_Bag | None" = None)
                 chunk = src.recv(65536)
                 if not chunk:
                     break
+                if which == "right":
+                    state["proxy"] = True
                 view = memoryview(chunk)
                 while view:
                     sent = dst.send(view)
@@ -237,6 +242,24 @@ def _relay(left: socket.socket, right: socket.socket, bag: "_Bag | None" = None)
 
     threading.Thread(target=pump, args=(left, right, "left"), daemon=True).start()
     threading.Thread(target=pump, args=(right, left, "right"), daemon=True).start()
+    if on_stall is None:
+        return
+
+    def watch() -> None:
+        time.sleep(proxy_config.GUEST_DIAL_TIMEOUT_S)
+        if state["proxy"]:
+            return
+        try:
+            on_stall()
+        except OSError:
+            pass
+        for end in (left, right):
+            try:
+                end.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=watch, daemon=True).start()
 
 
 def _exit_code(status: int) -> int:
@@ -369,6 +392,13 @@ class ProxySession:
         # (latency seconds, endpoint key) for proxies that already forwarded.
         # Fastest first. The one in use stays here until it fails.
         self._working: list[tuple[float, tuple]] = []
+        # Trace fields (loc, ip, colo) keyed the same way as _working.
+        self._details: dict[tuple, dict] = {}
+        # Repeated checks: uptime streak, success and failure counts, latency.
+        self._ledger: dict[tuple, ProxyRecord] = {}
+        self._recheck_at = 0
+        self._pool_cursor = 0
+        self._note = ""
         self._finding = False
         self._find_cv = threading.Condition()
         self._endpoints: tuple[ProxyEndpoint, ...] = ()
@@ -378,6 +408,10 @@ class ProxySession:
         self._listeners: list[socket.socket] = []
         self._ctrl_lock = threading.Lock()
         self._ctrl_buf = bytearray()
+        self._stall: "socket.socket | None" = None
+        # Ignore stall notices until this time. A notice from the proxy we
+        # just left must not abandon the one we just moved to.
+        self._stall_until = 0.0
 
     @property
     def killed(self) -> bool:
@@ -417,7 +451,8 @@ class ProxySession:
 
         ctrl_parent, ctrl_child = socket.socketpair()
         dial_parent, dial_child = socket.socketpair()
-        for end in (ctrl_parent, ctrl_child, dial_parent, dial_child):
+        stall_parent, stall_child = socket.socketpair()
+        for end in (ctrl_parent, ctrl_child, dial_parent, dial_child, stall_parent, stall_child):
             end.set_inheritable(False)
         ready_r, ready_w = os.pipe()
         go_r, go_w = os.pipe()
@@ -432,16 +467,18 @@ class ProxySession:
                 pass
             if os.getppid() == 1:
                 os._exit(1)
-            for end in (ctrl_parent, dial_parent):
+            for end in (ctrl_parent, dial_parent, stall_parent):
                 end.close()
             os.close(ready_r)
             os.close(go_w)
             _close_extra_fds({
-                ctrl_child.fileno(), dial_child.fileno(), ready_w, go_r, 0, 1, 2,
+                ctrl_child.fileno(), dial_child.fileno(), stall_child.fileno(),
+                ready_w, go_r, 0, 1, 2,
             })
             try:
                 _child_main(
-                    ctrl_child, dial_child, ready_w, go_r, session._fwd_path,
+                    ctrl_child, dial_child, stall_child, ready_w, go_r,
+                    session._fwd_path,
                 )
             except SystemExit:
                 raise
@@ -454,11 +491,13 @@ class ProxySession:
 
         ctrl_child.close()
         dial_child.close()
+        stall_child.close()
         os.close(ready_w)
         os.close(go_r)
         session._child = pid
         session._ctrl = ctrl_parent
         session._dial = dial_parent
+        session._stall = stall_parent
         try:
             mark = _read_byte(ready_r, 5)
             if mark != b"R":
@@ -486,12 +525,17 @@ class ProxySession:
             os.close(go_w)
             ctrl_parent.close()
             dial_parent.close()
+            stall_parent.close()
             die(f"Proxy: {exc}")
         os.close(ready_r)
         os.close(go_w)
 
         threading.Thread(target=session._dial_loop, name="qvm-proxy-dial", daemon=True).start()
+        threading.Thread(target=session._stall_loop, name="qvm-proxy-stall", daemon=True).start()
+        threading.Thread(target=session._command_loop, name="qvm-proxy-cmd", daemon=True).start()
+        threading.Thread(target=session._pool_loop, name="qvm-proxy-pool", daemon=True).start()
         threading.Thread(target=session._health_loop, name="qvm-proxy-health", daemon=True).start()
+        session._publish_status()
         for _guest, host_port in port_maps or []:
             session._listen_forward(host_port)
         return session
@@ -531,7 +575,7 @@ class ProxySession:
                 listener.close()
             except OSError:
                 pass
-        for end in (self._ctrl, self._dial):
+        for end in (self._ctrl, self._dial, self._stall):
             if end is not None:
                 try:
                     end.close()
@@ -548,6 +592,13 @@ class ProxySession:
                 os.unlink(self._fwd_path)
             except OSError:
                 pass
+        directory = getattr(self, "directory", "")
+        if directory:
+            for name in (proxy_config.STATUS_NAME, proxy_config.CMD_NAME):
+                try:
+                    os.unlink(os.path.join(directory, name))
+                except OSError:
+                    pass
 
     def _ctrl_rpc(self, payload: dict) -> dict:
         if self._ctrl is None:
@@ -588,27 +639,60 @@ class ProxySession:
     def _proxy_key(proxy: ProxyEndpoint) -> tuple:
         return (proxy.scheme, proxy.host, proxy.port, proxy.username, proxy.password)
 
-    def _remember_working(self, proxy: ProxyEndpoint, latency: float) -> None:
+    def _remember_working(
+        self, proxy: ProxyEndpoint, latency: float, info: "dict | None" = None,
+    ) -> None:
         """Keep a proxy that forwarded, fastest first. A repeat replaces its time."""
         key = self._proxy_key(proxy)
+        now = time.monotonic()
         with self._lock:
+            prior = self._ledger.get(key) or ProxyRecord()
+            self._ledger[key] = proxy_config.note_health(
+                prior, ok=True, now=now, latency=latency,
+            )
             self._working = [item for item in self._working if item[1] != key]
             self._working.append((latency, key))
-            self._working.sort(key=lambda item: item[0])
+            self._working.sort(key=self._working_sort)
+            if info:
+                self._details[key] = {
+                    "loc": str(info.get("loc") or ""),
+                    "ip": str(info.get("ip") or ""),
+                    "colo": str(info.get("colo") or ""),
+                }
+        self._publish_status()
+
+    def _record_failure(self, proxy: ProxyEndpoint) -> None:
+        """Count a failed check. The uptime streak ends."""
+        key = self._proxy_key(proxy)
+        now = time.monotonic()
+        with self._lock:
+            prior = self._ledger.get(key) or ProxyRecord()
+            self._ledger[key] = proxy_config.note_health(prior, ok=False, now=now)
+        self._publish_status()
+
+    def _working_sort(self, item: tuple) -> tuple:
+        """Fastest measured proxy first. A down proxy sorts last."""
+        _latency, key = item
+        return proxy_config.selection_key(self._ledger.get(key), time.monotonic())
 
     def _forget_working(self, proxy: ProxyEndpoint) -> None:
         key = self._proxy_key(proxy)
         with self._lock:
             self._working = [item for item in self._working if item[1] != key]
+            self._details.pop(key, None)
 
     def _take_standby(self) -> "tuple[int, ProxyEndpoint] | None":
-        """The fastest proxy that already forwarded and is still in the file."""
+        """The fastest saved proxy that is still in the file and not down."""
         with self._lock:
             endpoints = self._endpoints
             if not endpoints or not self._working:
                 return None
+            now = time.monotonic()
+            ranked = sorted(self._working, key=self._working_sort)
             by_key = {self._proxy_key(ep): (i, ep) for i, ep in enumerate(endpoints)}
-            for _latency, key in self._working:
+            for _latency, key in ranked:
+                if proxy_config.health_label(self._ledger.get(key), now) == "down":
+                    continue
                 found = by_key.get(key)
                 if found is not None:
                     return found
@@ -698,29 +782,31 @@ class ProxySession:
     ) -> None:
         proxy = endpoints[index % len(endpoints)]
         tunnel = None
+        with self._lock:
+            gen = self._pin_gen
         try:
             tunnel = _open_guest_tunnel(proxy, host, port)
             owned = tunnel
             tunnel = None
             self._pass_tunnel(dial_sock, index % len(endpoints), proxy, owned)
-        except proxy_tunnel.ProxyDown as exc:
+        except OSError as exc:
+            # Timeout, refusal, and a dead proxy are the same to the guest:
+            # this one is not carrying the connection. Try the next group
+            # for this same destination instead of sitting on it.
             if not allow_search:
                 self._dial_fail(str(exc))
                 return
-            # This proven proxy died on a real dial. Search the rest once.
-            self._drop_pin(index % len(endpoints))
-            nxt = self._await_working((index + 1) % len(endpoints))
-            with self._lock:
-                fresh = self._endpoints or endpoints
-                if fresh and self._pinned:
-                    nxt = self._state.index % len(fresh)
-            if nxt is None:
+            failed = index % len(endpoints)
+            self._abandon_if_current(failed, gen)
+            fresh = self._endpoints or endpoints
+            won = self._race_destination(
+                fresh, (failed + 1) % len(fresh), host, port, exclude=failed,
+            )
+            if won is None:
                 self._dial_fail(str(exc))
                 return
-            self._dial_through(dial_sock, fresh, nxt, host, port, allow_search=False)
-        except OSError as exc:
-            # The proxy answered and rejected this destination. Keep it.
-            self._dial_fail(str(exc))
+            win_index, win_tunnel = won
+            self._pass_tunnel(dial_sock, win_index, fresh[win_index], win_tunnel)
         finally:
             if tunnel is not None:
                 try:
@@ -809,21 +895,23 @@ class ProxySession:
                 return
             started = time.monotonic()
             try:
-                ok = proxy_tunnel.proxy_forwards(proxy, timeout)
+                info = proxy_tunnel.probe_details(proxy, timeout)
             except Exception:
-                ok = False
-            if not ok:
+                info = None
+            if not info:
                 return
             latency = time.monotonic() - started
-            self._remember_working(proxy, latency)
+            self._remember_working(proxy, latency, info)
             with lock:
                 first = not winner
                 if first:
                     winner.append(index)
                     found.set()
             if not first:
+                loc = str(info.get("loc") or "")
+                place = f", {proxy_config.country_name(loc)}" if loc else ""
                 print(
-                    f"Proxy standby {proxy.render()} ({latency:.2f}s).",
+                    f"Proxy standby {proxy.render()} ({latency:.2f}s{place}).",
                     file=sys.stderr, flush=True,
                 )
 
@@ -835,11 +923,10 @@ class ProxySession:
             thread.start()
             threads.append(thread)
         go.set()
-        # Each of the two tunnels may spend the budget on connect, the
-        # handshake, and the reply. A slow proxy that still returns bytes has
-        # to fit. The loop still ends as soon as one proxy proves both, or as
-        # soon as every attempt has finished.
-        deadline = time.monotonic() + timeout * 6 + 2.0
+        # One budget for the whole group. A proxy that has not proved itself
+        # by then is left behind, and the next group starts. Waiting out every
+        # slow handshake is what made a dead batch feel stuck.
+        deadline = time.monotonic() + timeout + 0.25
         while not found.is_set() and time.monotonic() < deadline:
             if threads and all(not thread.is_alive() for thread in threads):
                 break
@@ -853,10 +940,12 @@ class ProxySession:
             self._state = HealthState(index, None, False)
             self._pinned = True
             self._pin_gen += 1
+            self._stall_until = time.monotonic() + proxy_config.GUEST_DIAL_TIMEOUT_S
             announce = not self._announced
             self._announced = True
         if announce:
             print(f"Proxy using {proxy.render()}.", file=sys.stderr, flush=True)
+        self._publish_status()
 
     def _drop_pin(self, index: int) -> None:
         proxy = None
@@ -869,6 +958,280 @@ class ProxySession:
                 self._pin_gen += 1
         if proxy is not None:
             self._forget_working(proxy)
+
+    def _abandon_if_current(self, index: int, gen: int) -> None:
+        """Drop `index` only when it is still the pinned proxy.
+
+        A second guest connection failing at the same moment must not drop
+        the proxy the first failure already moved to.
+        """
+        proxy = None
+        with self._lock:
+            if self._pin_gen != gen or not self._pinned or self._state.index != index:
+                return
+            if self._endpoints and 0 <= index < len(self._endpoints):
+                proxy = self._endpoints[index]
+            self._pinned = False
+            self._announced = False
+            self._pin_gen += 1
+            self._stall_until = time.monotonic() + proxy_config.GUEST_DIAL_TIMEOUT_S
+        if proxy is None:
+            return
+        self._record_failure(proxy)
+        self._forget_working(proxy)
+        print(f"Proxy stopped forwarding {proxy.render()}.", file=sys.stderr, flush=True)
+
+    def _abandon_current(self) -> None:
+        """The pinned proxy went silent. Move on, and drop the stuck tunnels."""
+        if self.kill_switch or not self.plan.from_file:
+            return
+        with self._lock:
+            endpoints = self._endpoints
+            if not endpoints or len(endpoints) < 2 or not self._pinned:
+                return
+            if time.monotonic() < self._stall_until:
+                return
+            index = self._state.index % len(endpoints)
+            gen = self._pin_gen
+        self._abandon_if_current(index, gen)
+        self._ctrl_rpc({"op": "drop"})
+        self._ctrl_rpc({"op": "allow"})
+        fresh = self._endpoints or endpoints
+        self._await_working((index + 1) % len(fresh))
+
+    def _stall_loop(self) -> None:
+        sock = self._stall
+        if sock is None:
+            return
+        sock.settimeout(0.5)
+        while not self._stop.is_set():
+            try:
+                data = sock.recv(64)
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            if not data:
+                return
+            self._abandon_current()
+
+    def _command_loop(self) -> None:
+        """Pick up `proxy.cmd` from `qvm --configure` without waiting on a probe."""
+        path = os.path.join(self.directory, proxy_config.CMD_NAME)
+        while not self._stop.is_set():
+            if os.path.isfile(path):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        text = fh.read()
+                    os.unlink(path)
+                except OSError:
+                    text = ""
+                if "next" in text.lower():
+                    self._force_next()
+            if self._stop.wait(0.05):
+                return
+
+    def _force_next(self) -> None:
+        """Drop the proxy in use and pin the next saved one, with no new canary."""
+        if self.kill_switch:
+            self._note = "Kill switch is on. This proxy stays."
+            self._publish_status()
+            return
+        with self._lock:
+            endpoints = tuple(self._endpoints)
+            pinned = self._pinned
+            index = 0 if not endpoints else self._state.index % len(endpoints)
+            gen = self._pin_gen
+        if not self.plan.from_file or len(endpoints) < 2:
+            self._note = "Only one proxy is configured."
+            self._publish_status()
+            return
+        if pinned:
+            self._abandon_if_current(index, gen)
+        standby = self._take_standby()
+        self._ctrl_rpc({"op": "drop"})
+        self._ctrl_rpc({"op": "allow"})
+        if standby is not None:
+            nxt, proxy = standby
+            self._pin_forwarding(nxt, proxy)
+            self._note = f"Switched to {proxy.render()}."
+            self._publish_status()
+            return
+        self._note = "No saved proxy. Trying the next 10."
+        self._publish_status()
+        self._await_working((index + 1) % len(endpoints))
+        self._publish_status()
+
+    def _health_fields(self, key: tuple, latency: "float | None", now: float) -> dict:
+        record = self._ledger.get(key)
+        label = proxy_config.health_label(record, now)
+        up = 0
+        if record is not None and record.streak_since is not None and record.streak_ok:
+            up = int(max(0.0, now - record.streak_since))
+        shown = latency
+        if shown is None and record is not None:
+            shown = record.latency
+        return {
+            "latency_ms": None if shown is None else int(round(shown * 1000)),
+            "state": label,
+            "uptime_s": up,
+            "ok": 0 if record is None else record.ok_count,
+            "fail": 0 if record is None else record.fail_count,
+            "responsive": label in ("responsive", "durable"),
+            "durable": label == "durable",
+        }
+
+    def _status_document(self) -> dict:
+        now = time.monotonic()
+        with self._lock:
+            endpoints = tuple(self._endpoints)
+            pinned = self._pinned
+            index = 0 if not endpoints else self._state.index % len(endpoints)
+            working = list(self._working)
+            details = dict(self._details)
+            note = self._note
+            by_key = {self._proxy_key(ep): ep for ep in endpoints}
+
+            def row(key: tuple, latency: "float | None") -> "dict | None":
+                proxy = by_key.get(key)
+                if proxy is None:
+                    return None
+                info = details.get(key) or {}
+                loc = str(info.get("loc") or "")
+                fields = self._health_fields(key, latency, now)
+                fields.update({
+                    "url": proxy.render(),
+                    "country": loc,
+                    "country_name": proxy_config.country_name(loc),
+                    "exit_ip": str(info.get("ip") or ""),
+                    "colo": str(info.get("colo") or ""),
+                })
+                return fields
+
+            current = None
+            current_key = None
+            if pinned and endpoints:
+                current_key = self._proxy_key(endpoints[index])
+                latency = next((lat for lat, key in working if key == current_key), None)
+                current = row(current_key, latency)
+            standbys = []
+            for latency, key in working:
+                if key == current_key:
+                    continue
+                item = row(key, latency)
+                if item is not None and item.get("state") != "down":
+                    standbys.append(item)
+            failed = []
+            for key, record in self._ledger.items():
+                if proxy_config.health_label(record, now) != "down":
+                    continue
+                item = row(key, record.latency)
+                if item is not None:
+                    failed.append((record.last_fail or 0, item))
+            failed.sort(key=lambda pair: pair[0], reverse=True)
+        return {
+            "running": True,
+            "current": current,
+            "standbys": standbys,
+            "failed": [item for _when, item in failed[:8]],
+            "note": note,
+        }
+
+    def _publish_status(self) -> None:
+        directory = getattr(self, "directory", "")
+        if not directory:
+            return
+        path = os.path.join(directory, proxy_config.STATUS_NAME)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._status_document(), fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    def _next_candidates(self, endpoints, start: int, exclude: int) -> list:
+        """Up to PARALLEL_ATTEMPTS proxies to try for one guest destination.
+
+        Saved proxies come first. The rest of the file fills the group. The
+        proxy that just failed is not in the group.
+        """
+        chosen: list = []
+        seen = {exclude}
+        with self._lock:
+            working = list(self._working)
+        by_key = {self._proxy_key(ep): i for i, ep in enumerate(endpoints)}
+        for _latency, key in working:
+            index = by_key.get(key)
+            if index is None or index in seen:
+                continue
+            seen.add(index)
+            chosen.append((index, endpoints[index]))
+            if len(chosen) >= proxy_config.PARALLEL_ATTEMPTS:
+                return chosen
+        # Saved proxies are tried on their own. A cold scan only happens when
+        # none of them is left, and that scan is the one that is announced.
+        if chosen:
+            return chosen
+        for group in proxy_config.batch_indexes(
+            len(endpoints), start, proxy_config.PARALLEL_ATTEMPTS,
+        ):
+            for index in group:
+                if index in seen:
+                    continue
+                seen.add(index)
+                chosen.append((index, endpoints[index]))
+                if len(chosen) >= proxy_config.PARALLEL_ATTEMPTS:
+                    break
+            break
+        if chosen:
+            shown = ", ".join(ep.render() for _i, ep in chosen)
+            print(f"Proxy trying {len(chosen)}: {shown}", file=sys.stderr, flush=True)
+        return chosen
+
+    def _race_destination(self, endpoints, start: int, host: str, port: int, exclude: int):
+        """First proxy in the next group that opens `host:port`. None if none do."""
+        candidates = self._next_candidates(endpoints, start, exclude)
+        if not candidates:
+            return None
+        found = threading.Event()
+        lock = threading.Lock()
+        winner: list = []
+
+        def attempt(index: int, proxy: ProxyEndpoint) -> None:
+            tunnel = None
+            try:
+                tunnel = _open_guest_tunnel(proxy, host, port)
+            except OSError:
+                self._record_failure(proxy)
+                self._forget_working(proxy)
+                return
+            with lock:
+                if winner:
+                    try:
+                        tunnel.close()
+                    except OSError:
+                        pass
+                    return
+                winner.append((index, tunnel))
+                found.set()
+
+        for index, proxy in candidates:
+            threading.Thread(
+                target=attempt, args=(index, proxy), name="qvm-proxy-dial", daemon=True,
+            ).start()
+        found.wait(proxy_config.GUEST_DIAL_TIMEOUT_S + 0.4)
+        if not winner:
+            return None
+        index, tunnel = winner[0]
+        self._remember_working(endpoints[index], proxy_config.GUEST_DIAL_TIMEOUT_S)
+        self._pin_forwarding(index, endpoints[index])
+        return index, tunnel
 
     def _pass_tunnel(
         self, dial_sock: socket.socket, index: int, proxy: ProxyEndpoint, tunnel: socket.socket,
@@ -886,6 +1249,7 @@ class ProxySession:
                     self._state = HealthState(index, None, False)
                     self._pinned = True
                     self._pin_gen += 1
+                    self._stall_until = time.monotonic() + proxy_config.GUEST_DIAL_TIMEOUT_S
                     announce = not self._announced
                     self._announced = True
             if failed:
@@ -926,8 +1290,8 @@ class ProxySession:
     def _guest_sockets(self) -> int:
         """How many sockets the namespace is holding for the guest.
 
-        A canary opened on top of those can reset a proxy that only just
-        proved it can carry two. Live traffic is the heartbeat instead.
+        A non-zero count is not proof the proxy works: those sockets may be
+        stuck. The health check still runs, and it asks for a fast answer.
         """
         response = self._ctrl_rpc({"op": "active"})
         if not response.get("ok"):
@@ -965,28 +1329,179 @@ class ProxySession:
             gen = self._pin_gen
         if single:
             if not self._guest_sockets():
-                ok = proxy_tunnel.proxy_forwards(proxy, proxy_config.PROBE_TIMEOUT_S)
-                self._note_current(proxy, ok)
+                started = time.monotonic()
+                info = proxy_tunnel.probe_details(proxy, proxy_config.PROBE_TIMEOUT_S)
+                if info is not None:
+                    self._remember_working(proxy, time.monotonic() - started, info)
+                else:
+                    self._record_failure(proxy)
+                self._note_current(proxy, info is not None)
             return
         if not pinned:
             self._await_working(index)
             return
+        # Open guest sockets are not a heartbeat. A tunnel can sit there
+        # forever while the proxy sends nothing. Probe anyway, and when the
+        # guest is mid-connection demand a fast answer.
         if self._guest_sockets():
-            return
-        ok = proxy_tunnel.proxy_forwards(proxy, proxy_config.PROBE_TIMEOUT_S)
+            timeout = proxy_config.GUEST_DIAL_TIMEOUT_S
+        else:
+            timeout = proxy_config.PROBE_TIMEOUT_S
+        started = time.monotonic()
+        info = proxy_tunnel.probe_details(proxy, timeout)
+        latency = time.monotonic() - started
+        ok = info is not None
         with self._lock:
             if self._pin_gen != gen or not self._pinned or not self._endpoints:
                 return
             current = self._endpoints[self._state.index % len(self._endpoints)]
-            if current != proxy or ok:
+            if current != proxy:
                 return
-            self._pinned = False
-            self._announced = False
-            self._pin_gen += 1
-            nxt = (index + 1) % len(self._endpoints)
+            if not ok:
+                self._pinned = False
+                self._announced = False
+                self._pin_gen += 1
+                self._stall_until = time.monotonic() + proxy_config.GUEST_DIAL_TIMEOUT_S
+                nxt = (index + 1) % len(self._endpoints)
+        if ok:
+            self._remember_working(proxy, latency, info)
+            return
+        self._record_failure(proxy)
         self._forget_working(proxy)
         print(f"Proxy stopped forwarding {proxy.render()}.", file=sys.stderr, flush=True)
+        # Cut tunnels that are stuck on the proxy we just left, then allow
+        # the guest to dial again through the next one.
+        self._ctrl_rpc({"op": "drop"})
+        self._ctrl_rpc({"op": "allow"})
         self._await_working(nxt)
+
+    def _pool_loop(self) -> None:
+        """Measure the rest of the proxy list without touching the guest dial.
+
+        Each pass proves up to PARALLEL_ATTEMPTS proxies in parallel: saved
+        ones first, then the next unread part of the file. A clearly faster
+        result replaces the proxy in use. The dial thread does not wait for
+        this work.
+        """
+        while not self._stop.is_set():
+            if self._stop.wait(proxy_config.PROBE_EVERY_S):
+                return
+            if self.kill_switch or not self.plan.from_file:
+                continue
+            try:
+                self._pool_once()
+            except Exception:
+                continue
+
+    def _pool_targets(self, endpoints: tuple) -> list:
+        """Saved proxies, then the next file window. The one in use is skipped."""
+        with self._lock:
+            if not endpoints or not self._pinned:
+                current_key = None
+            else:
+                current_key = self._proxy_key(endpoints[self._state.index % len(endpoints)])
+            saved = [key for _lat, key in self._working if key != current_key]
+            by_key = {self._proxy_key(ep): ep for ep in endpoints}
+        chosen: list = []
+        seen: set = set()
+        if current_key is not None:
+            seen.add(current_key)
+        for key in saved:
+            proxy = by_key.get(key)
+            if proxy is None or key in seen:
+                continue
+            seen.add(key)
+            chosen.append(proxy)
+            if len(chosen) >= proxy_config.PARALLEL_ATTEMPTS:
+                return chosen
+        count = len(endpoints)
+        if count < 1:
+            return chosen
+        start = self._pool_cursor % count
+        for offset in range(count):
+            proxy = endpoints[(start + offset) % count]
+            key = self._proxy_key(proxy)
+            if key in seen:
+                continue
+            seen.add(key)
+            chosen.append(proxy)
+            if len(chosen) >= proxy_config.PARALLEL_ATTEMPTS:
+                break
+        self._pool_cursor = (start + max(1, len(chosen))) % count
+        return chosen
+
+    def _pool_once(self) -> None:
+        endpoints = tuple(self._refresh_endpoints())
+        if len(endpoints) < 2:
+            return
+        targets = self._pool_targets(endpoints)
+        if not targets:
+            return
+        threads = []
+
+        def check(proxy: ProxyEndpoint) -> None:
+            started = time.monotonic()
+            try:
+                info = proxy_tunnel.probe_details(proxy, proxy_config.PROBE_TIMEOUT_S)
+            except Exception:
+                info = None
+            if info is not None:
+                self._remember_working(proxy, time.monotonic() - started, info)
+                return
+            self._record_failure(proxy)
+            self._forget_working(proxy)
+
+        for proxy in targets:
+            thread = threading.Thread(
+                target=check, args=(proxy,), name="qvm-proxy-pool", daemon=True,
+            )
+            thread.start()
+            threads.append(thread)
+        deadline = time.monotonic() + proxy_config.PROBE_TIMEOUT_S + 0.5
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        self._promote_fastest()
+
+    def _promote_fastest(self) -> None:
+        """Move the guest onto a saved proxy that measured clearly faster."""
+        if self.kill_switch or not self.plan.from_file:
+            return
+        with self._lock:
+            endpoints = tuple(self._endpoints)
+            if not endpoints or not self._pinned or len(endpoints) < 2:
+                return
+            index = self._state.index % len(endpoints)
+            current_key = self._proxy_key(endpoints[index])
+            current_latency = next(
+                (lat for lat, key in self._working if key == current_key), None,
+            )
+            gen = self._pin_gen
+        standby = self._take_standby()
+        if standby is None:
+            return
+        nxt, proxy = standby
+        if nxt == index:
+            return
+        key = self._proxy_key(proxy)
+        with self._lock:
+            if self._pin_gen != gen or not self._pinned:
+                return
+            candidate = next((lat for lat, item in self._working if item == key), None)
+        if not proxy_config.should_promote(current_latency, candidate):
+            return
+        self._pin_forwarding(nxt, proxy)
+        self._note = f"Faster proxy {proxy.render()}."
+        self._ctrl_rpc({"op": "drop"})
+        self._ctrl_rpc({"op": "allow"})
+        milliseconds = 0 if candidate is None else int(round(candidate * 1000))
+        print(
+            f"Proxy using {proxy.render()} ({milliseconds} ms).",
+            file=sys.stderr, flush=True,
+        )
+        self._publish_status()
 
     def _note_current(self, proxy: ProxyEndpoint, ok: bool) -> None:
         """Record one result for `proxy`, but only if it is still current.
@@ -1069,7 +1584,7 @@ def _run(args: list[str]) -> None:
         raise RuntimeError(f"{' '.join(args)} failed: {detail}")
 
 
-def _child_main(ctrl, dial_sock, ready_w: int, go_r: int, fwd_path: str) -> None:
+def _child_main(ctrl, dial_sock, stall_sock, ready_w: int, go_r: int, fwd_path: str) -> None:
     libc = _libc_so()
     if libc.unshare(_CLONE_NEWUSER | _CLONE_NEWNET) != 0:
         err = __import__("ctypes").get_errno()
@@ -1102,7 +1617,13 @@ def _child_main(ctrl, dial_sock, ready_w: int, go_r: int, fwd_path: str) -> None
             raise ConnectionError("proxy kill switch: guest internet is off")
         return remote
 
-    _serve_capture(dial_fn=dial, bag=bag)
+    def stalled() -> None:
+        try:
+            stall_sock.send(b"\n")
+        except OSError:
+            pass
+
+    _serve_capture(dial_fn=dial, bag=bag, on_stall=stalled)
     _serve_forwards(fwd_path)
     os.write(ready_w, b"U")
     os.close(ready_w)
@@ -1156,26 +1677,28 @@ def _transparent_socket(kind: int, port: int) -> socket.socket:
     return sock
 
 
-def _serve_capture(dial_fn, bag: _Bag) -> None:
+def _serve_capture(dial_fn, bag: _Bag, on_stall=None) -> None:
     tcp = _transparent_socket(socket.SOCK_STREAM, _TCP_LISTEN)
     tcp.listen(128)
     udp = _transparent_socket(socket.SOCK_DGRAM, _UDP_LISTEN)
     udp.settimeout(0.5)
     threading.Thread(
-        target=_accept_tcp, args=(tcp, dial_fn, bag), name="qvm-proxy-tcp", daemon=True,
+        target=_accept_tcp, args=(tcp, dial_fn, bag, on_stall), name="qvm-proxy-tcp", daemon=True,
     ).start()
     threading.Thread(
-        target=_recv_udp, args=(udp, dial_fn, bag), name="qvm-proxy-udp", daemon=True,
+        target=_recv_udp, args=(udp, dial_fn, bag, on_stall), name="qvm-proxy-udp", daemon=True,
     ).start()
 
 
-def _accept_tcp(listener: socket.socket, dial_fn, bag: _Bag) -> None:
+def _accept_tcp(listener: socket.socket, dial_fn, bag: _Bag, on_stall=None) -> None:
     while True:
         try:
             client, _addr = listener.accept()
         except OSError:
             return
-        threading.Thread(target=_handle_tcp, args=(client, dial_fn, bag), daemon=True).start()
+        threading.Thread(
+            target=_handle_tcp, args=(client, dial_fn, bag, on_stall), daemon=True,
+        ).start()
 
 
 def _original_tcp(client: socket.socket) -> "tuple[str, int] | None":
@@ -1195,7 +1718,7 @@ def _original_tcp(client: socket.socket) -> "tuple[str, int] | None":
     return _sockaddr_port_ip(raw)
 
 
-def _handle_tcp(client: socket.socket, dial_fn, bag: _Bag) -> None:
+def _handle_tcp(client: socket.socket, dial_fn, bag: _Bag, on_stall=None) -> None:
     try:
         if not bag.add(client):
             return
@@ -1213,10 +1736,10 @@ def _handle_tcp(client: socket.socket, dial_fn, bag: _Bag) -> None:
         except OSError:
             pass
         return
-    _relay(client, remote, bag)
+    _relay(client, remote, bag, on_stall)
 
 
-def _recv_udp(listener: socket.socket, dial_fn, bag: _Bag) -> None:
+def _recv_udp(listener: socket.socket, dial_fn, bag: _Bag, on_stall=None) -> None:
     while True:
         try:
             data, anc, _flags, addr = listener.recvmsg(65535, 512)
@@ -1233,7 +1756,7 @@ def _recv_udp(listener: socket.socket, dial_fn, bag: _Bag) -> None:
         if not data or parsed is None or parsed[1] != 53 or _local_destination(parsed[0]):
             continue
         threading.Thread(
-            target=_handle_dns, args=(data, addr, parsed, dial_fn, bag), daemon=True,
+            target=_handle_dns, args=(data, addr, parsed, dial_fn, bag, on_stall), daemon=True,
         ).start()
 
 
@@ -1302,7 +1825,7 @@ def _dns_over_https(dial_fn, payload: bytes, bag: _Bag) -> bytes:
             remote = dial_fn(host, 443)
             if bag.drop:
                 return b""
-            remote.settimeout(8)
+            remote.settimeout(proxy_config.GUEST_DIAL_TIMEOUT_S)
             tls = ssl.create_default_context().wrap_socket(remote, server_hostname=host)
             tls.sendall(request_for.format(host=host, length=len(payload)).encode() + payload)
             body = _read_http_body(tls)
@@ -1323,7 +1846,7 @@ def _dns_over_https(dial_fn, payload: bytes, bag: _Bag) -> bytes:
     return b""
 
 
-def _handle_dns(payload: bytes, client_addr, orig: tuple, dial_fn, bag: _Bag) -> None:
+def _handle_dns(payload: bytes, client_addr, orig: tuple, dial_fn, bag: _Bag, on_stall=None) -> None:
     targets = []
     primary = _public_dns_target(orig[0])
     for candidate in (primary, "1.1.1.1", "8.8.8.8"):
@@ -1339,12 +1862,16 @@ def _handle_dns(payload: bytes, client_addr, orig: tuple, dial_fn, bag: _Bag) ->
             remote = None
     if remote is not None and not bag.drop:
         try:
-            remote.settimeout(5)
+            remote.settimeout(proxy_config.GUEST_DIAL_TIMEOUT_S)
             remote.sendall(struct.pack("!H", len(payload)) + payload)
             header = proxy_tunnel.recvall(remote, 2)
             size = struct.unpack("!H", header)[0]
             if size <= 8192:
                 body = proxy_tunnel.recvall(remote, size) if size else b""
+        except TimeoutError:
+            body = b""
+            if on_stall is not None:
+                on_stall()
         except OSError:
             body = b""
         finally:
