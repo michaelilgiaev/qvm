@@ -74,6 +74,13 @@ a running VM applies edits live where it can, and reverts a file with an invalid
                                   False = generic software-rendered GPU
   Network                         "user" (NAT) | "none" | a host interface to bridge
                                   (list interfaces: ip -br addr)
+  Proxy                           False | "socks5://host:port" | "http://host:port"
+                                  | a file name beside hypervisor.cfg (one URL
+                                  per line; "proxies" is the usual name). The
+                                  guest's traffic is sent through that proxy.
+  Proxy_Kill_Switch               True: a lost proxy cuts this guest's internet
+                                  until the proxy answers. False: with a proxy
+                                  file, switch to the next URL after 10 seconds.
   Shared                          False | True (this dir) | an absolute host path
                                   to share into the guest via virtiofs
   Clipboard                       share the clipboard host<->guest (SPICE vdagent)
@@ -92,7 +99,7 @@ a running VM applies edits live where it can, and reverts a file with an invalid
   Audio                           True | False (True = PipeWire; confirm: pactl info)
 
 ENV OVERRIDES (override hypervisor.cfg at runtime, not persisted):
-  NETWORK  DISK_SIZE_GB  RAM  CPUS  AUDIO  PORTS  SHARED  USB
+  NETWORK  PROXY  PROXY_KILL_SWITCH  DISK_SIZE_GB  RAM  CPUS  AUDIO  PORTS  SHARED  USB
   SHARE_HOST_GPU=1  SECURE_SHELL=1  CLIPBOARD=1  FULLSCREEN=1  ASK_QUIT=1
   FORCE=1  YES=1  VENUS=1  DRYRUN=1   (legacy SSH=1 / SSHPORT / DISK_SIZE still honoured)
 

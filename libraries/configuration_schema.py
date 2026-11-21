@@ -23,8 +23,9 @@ The FILE FORMAT this validates (what `install` writes):
 
 Type model (per key):
   bool     : Share_Host_GPU, Clipboard, Secure_Shell, Fullscreen,
-             Ask_Before_Quitting_Hypervisor, Audio
+             Ask_Before_Quitting_Hypervisor, Audio, Proxy_Kill_Switch
   string   : Network              (user | none | <interface name>)
+  proxy    : Proxy                (False | socks5:// or http:// URL | a file name)
   shared   : Shared               (False | True/empty = working dir | /abs/path)
   usb      : USB                  (False/empty | /dev/... [more /dev/...])
   ports    : Ports                (guest:host maps; the 22:host map is the ssh forward)
@@ -35,6 +36,8 @@ Type model (per key):
 from __future__ import annotations
 
 import re
+
+import proxy_config
 
 # --- primitive coercers: each returns (ok, value, error) --------------------
 # value is meaningful only when ok is True.
@@ -169,6 +172,13 @@ def _coerce_forward_port(raw):
 _IFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
 
 
+def _coerce_proxy(raw):
+    """False/off -> no proxy. A socks5:// or http:// URL, or a file name (no
+    slash) that lives next to hypervisor.cfg, such as `proxies`. The file is
+    not opened here; booting reads it."""
+    return proxy_config.coerce_proxy_spec(raw)
+
+
 def _coerce_network(raw):
     s = _as_str(raw)
     if s is None:
@@ -265,6 +275,8 @@ def _coerce_ports(raw):
 SCHEMA = {
     "Share_Host_GPU":                 _coerce_bool,
     "Network":                        _coerce_network,
+    "Proxy":                          _coerce_proxy,
+    "Proxy_Kill_Switch":              _coerce_bool,
     "Shared":                         _coerce_shared,
     "Clipboard":                      _coerce_bool,
     "Secure_Shell":                   _coerce_bool,

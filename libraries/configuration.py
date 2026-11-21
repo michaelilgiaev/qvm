@@ -50,6 +50,8 @@ DISK_NAME = "azzio.qcow2"
 _CFG_DEFAULTS: dict = {
     "Share_Host_GPU":                 True,
     "Network":                        "user",
+    "Proxy":                          False,
+    "Proxy_Kill_Switch":              False,
     "Shared":                         False,
     "Clipboard":                      False,
     "Secure_Shell":                   False,
@@ -76,6 +78,8 @@ _CFG_HEADER = (
     ' maps ("22:49156, 1500:49157").\n'
     "### USB: False or device path(s) (\"lsusb\", \"lsblk -o NAME,TRAN,MOUNTPOINT\")."
     " Edits apply live where they can.\n"
+    '### Proxy: False | "socks5://host:port" | "http://host:port" | a file name beside this'
+    " file (one URL per line). Proxy_Kill_Switch cuts guest internet when that proxy drops.\n"
 )
 
 
@@ -152,6 +156,8 @@ def resolve_sizes(vals: dict, directory: str) -> None:
 class HypervisorCfg:
     share_host_gpu: bool
     network: str
+    proxy: "bool | str"   # False, a socks5/http URL, or a file name beside hypervisor.cfg
+    proxy_kill_switch: bool
     shared: "bool | str"
     clipboard: bool
     secure_shell: bool
@@ -210,6 +216,8 @@ class HypervisorCfg:
 _FIELD_FOR_KEY = {
     "Share_Host_GPU": "share_host_gpu",
     "Network": "network",
+    "Proxy": "proxy",
+    "Proxy_Kill_Switch": "proxy_kill_switch",
     "Shared": "shared",
     "Clipboard": "clipboard",
     "Secure_Shell": "secure_shell",
@@ -235,6 +243,8 @@ def _as_dataclass_kwargs(vals: dict) -> dict:
 # override is validated exactly like a file value.
 _ENV_OVERRIDES = {
     "NETWORK":        "Network",
+    "PROXY":          "Proxy",
+    "PROXY_KILL_SWITCH": "Proxy_Kill_Switch",
     "DISK_SIZE_GB":   "Disk_Size_GB",
     "RAM":            "RAM",
     "CPUS":           "CPUs",

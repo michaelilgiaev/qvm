@@ -10,6 +10,7 @@ remote-viewer window opened full-screen. SPICE stays gl=off in every branch
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import signal
@@ -34,6 +35,8 @@ from graphics import select_render_node  # noqa: E402
 # build_qemu_argv + virtiofsd_argv are the pure argv builders (both in qemu_command);
 # re-exported so do_run and the tests still reach vm.build_qemu_argv / vm.virtiofsd_argv.
 from qemu_command import build_qemu_argv, virtiofsd_argv  # noqa: E402
+import proxy_config  # noqa: E402
+import proxy_runtime  # noqa: E402
 # Host-wide `ls` enumeration lives in vm_instances (split for size + concern). Re-exported
 # so vm.do_ls / vm._running_instances / vm._cfg_ssh_port / vm._pid_cwd still resolve here.
 from vm_instances import (  # noqa: E402
@@ -176,6 +179,33 @@ def _auto_install_iso(cfg: Config, requested: str, disk: str) -> str:
     return cfg.find_iso()
 
 
+def _prepare_proxy(cfg: Config) -> "tuple[Config, object]":
+    """Resolve Proxy. A bridge uses user-mode NAT for this boot so it cannot
+    bypass the proxy. Network=none has no NIC, so nothing is started. The
+    namespace is created in _launch, which a DRYRUN never reaches."""
+    spec = cfg.hcfg.proxy
+    if spec is False:
+        return cfg, None
+    try:
+        plan = proxy_config.load_plan(cfg.dir, spec)
+    except (OSError, ValueError) as exc:
+        die(f"Proxy: {exc}")
+    print(proxy_config.describe(plan, cfg.hcfg.proxy_kill_switch), file=sys.stderr)
+    net = cfg.hcfg.network
+    if net == "none":
+        print("WARNING: Proxy is set but Network=none, so this guest has no NIC.",
+              file=sys.stderr)
+        return cfg, None
+    if net != "user":
+        print(
+            f"Proxy is set, so Network={net} uses user-mode NAT for this boot. "
+            "A bridge would bypass the proxy.",
+            file=sys.stderr,
+        )
+        cfg = dataclasses.replace(cfg, hcfg=dataclasses.replace(cfg.hcfg, network="user"))
+    return cfg, plan
+
+
 # --- run ---------------------------------------------------------------------
 def do_run(cfg: Config, install_iso: str = "", headless: bool = False) -> None:
     """Assemble and launch the QEMU VM, then a remote-viewer window against it.
@@ -238,6 +268,7 @@ def do_run(cfg: Config, install_iso: str = "", headless: bool = False) -> None:
 
     port = select_ssh_port(cfg) if hcfg.secure_shell else None
     port_maps = _resolve_port_maps(cfg, port)
+    cfg, proxy_plan = _prepare_proxy(cfg)
     _write_viewer_ask_quit(hcfg.ask_before_quitting_hypervisor)
 
     checks.require_not_running(cfg)
@@ -250,7 +281,8 @@ def do_run(cfg: Config, install_iso: str = "", headless: bool = False) -> None:
         print(" ".join(_shquote(a) for a in qemu))
         return
 
-    _launch(cfg, qemu, port, headless=headless)
+    _launch(cfg, qemu, port, headless=headless,
+            proxy_plan=proxy_plan, port_maps=port_maps)
 
 
 def _resolve_port_maps(cfg: Config, ssh_port: "int | None") -> list:
@@ -404,7 +436,7 @@ def _spawn_viewer(cfg: Config) -> "subprocess.Popen":
 
 
 def _launch(cfg: Config, qemu: list[str], port: "int | None",
-            headless: bool = False) -> None:
+            headless: bool = False, proxy_plan=None, port_maps=None) -> None:
     hcfg = cfg.hcfg
     """Boot QEMU, wait for the SPICE socket, launch the viewer; whichever dies
     first tears the other down. Mirrors run.sh's trap-based lifecycle. A
@@ -419,6 +451,7 @@ def _launch(cfg: Config, qemu: list[str], port: "int | None",
     viewer_proc: subprocess.Popen | None = None
     virtiofsd_proc: subprocess.Popen | None = None
     watcher: "configuration_watcher.ConfigWatcher | None" = None
+    proxy_session: "proxy_runtime.ProxySession | None" = None
     # Snapshot the terminal BEFORE spawning any child, so teardown can undo a child
     # (remote-viewer/VTE) leaving it raw. See _tty_restore.
     saved_tty = _tty_save()
@@ -433,6 +466,12 @@ def _launch(cfg: Config, qemu: list[str], port: "int | None",
         _cleaned["done"] = True
         if watcher is not None:
             watcher.stop()
+        # The supervisor owns QEMU. Close it before the host-side kills.
+        if proxy_session is not None:
+            try:
+                proxy_session.close()
+            except Exception:
+                pass
         # Kill every child we spawned so NOTHING outlives the VM -- viewer, QEMU, and
         # the virtiofsd daemon (now a plain non-root child of ours, so kill() reaches
         # it directly; no sudo, no orphaned root daemon holding the share dir open).
@@ -462,9 +501,6 @@ def _launch(cfg: Config, qemu: list[str], port: "int | None",
         cleanup()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, _sig)
-    signal.signal(signal.SIGTERM, _sig)
-
     ssh_info = f"  SSH -> localhost:{port}" if port is not None else ""
     print(
         f"Booting VM '{cfg.vm}': {cfg.cpus} vCPU, {cfg.ram} MiB RAM.{ssh_info}",
@@ -472,13 +508,24 @@ def _launch(cfg: Config, qemu: list[str], port: "int | None",
     )
 
     try:
-        # Spawn the virtiofsd daemon FIRST (when shared is on): QEMU's vhost-user
-        # chardev connects to its socket at startup, so the socket must already be
-        # listening. Depends only on shared -- never on ssh -- so the share appears
-        # on every variant. Killed in cleanup() with the rest of the VM.
+        # Fork before the sys.exit handlers. The child ignores signals first;
+        # a handler installed earlier would be inherited and could exit it.
+        if proxy_plan is not None:
+            proxy_session = proxy_runtime.ProxySession.start(
+                proxy_plan, cfg.hcfg.proxy_kill_switch, list(port_maps or []), cfg.dir,
+            )
+        signal.signal(signal.SIGINT, _sig)
+        signal.signal(signal.SIGTERM, _sig)
+
+        # virtiofsd FIRST (when shared is on): QEMU connects to its socket at
+        # startup. It stays in the host namespace; the socket is a file.
+        # Killed in cleanup() with the rest of the VM.
         virtiofsd_proc = _spawn_virtiofsd(cfg)
 
-        qemu_proc = subprocess.Popen(qemu)
+        if proxy_session is not None:
+            qemu_proc = proxy_session.spawn(qemu)
+        else:
+            qemu_proc = subprocess.Popen(qemu)
 
         # wait for the SPICE socket, then launch our own viewer against it (unless
         # headless -- QEMU still CREATES the socket either way, so `qvm view`

@@ -44,6 +44,8 @@ def do_status(cfg: Config) -> None:
     print(f"Shared:    {shared}")
     print(f"ISO:       {iso or '(none in dir)'}")
     print(f"SSH:       {ssh}")
+    proxy = "off" if hcfg.proxy is False else hcfg.proxy
+    print(f"Proxy:     {proxy}   Proxy_Kill_Switch={hcfg.proxy_kill_switch}")
     print(f"Toggles:   Share_Host_GPU={hcfg.share_host_gpu}  Network={hcfg.network}  "
           f"Shared={hcfg.shared}  Clipboard={hcfg.clipboard}  Secure_Shell={hcfg.secure_shell}  "
           f"Ports={ports}  USB={usb}  Fullscreen={hcfg.fullscreen}  "

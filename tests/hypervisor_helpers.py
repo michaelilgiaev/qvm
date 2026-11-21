@@ -20,6 +20,8 @@ from configuration import HypervisorCfg, Config, GUEST_SSH_PORT
 _HCFG_DEFAULTS = {
     "share_host_gpu": True,
     "network": "user",
+    "proxy": False,
+    "proxy_kill_switch": False,
     "shared": False,
     "clipboard": False,
     "secure_shell": False,

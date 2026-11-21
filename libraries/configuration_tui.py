@@ -36,6 +36,8 @@ except ImportError:  # a Python built without _curses; run() reports it
 FIELD_HELP = {
     "Share_Host_GPU": "Guest uses the host GPU (shared, not passthrough). False = software GPU.",
     "Network": '"user" (NAT), "none", or a host interface. Space cycles the choices.',
+    "Proxy": 'False, a socks5:// or http:// URL, or a file name such as proxies (one URL per line).',
+    "Proxy_Kill_Switch": "Cut the guest's internet when the proxy drops. Off fails over after 10 seconds.",
     "Shared": "False, True (this directory), or an absolute host path shared via virtiofs.",
     "Clipboard": "Share the clipboard between the host and the guest (SPICE vdagent).",
     "Secure_Shell": "Forward the guest SSH port to the host.",
@@ -59,6 +61,7 @@ _BOOL_KEYS = {
     "Fullscreen",
     "Ask_Before_Quitting_Hypervisor",
     "Audio",
+    "Proxy_Kill_Switch",
 }
 
 _NAV_HINT = " arrows/jk move   enter edit   space toggle   s save   q quit   ? help"
@@ -658,7 +661,7 @@ def _typeahead_ok(field: str, key: int) -> bool:
     ch = chr(key)
     if ch.isdigit() or ch in "%/,.:":
         return True
-    if field in ("Network", "Shared", "USB", "Ports") and ch.isalpha():
+    if field in ("Network", "Shared", "USB", "Ports", "Proxy") and ch.isalpha():
         return True
     return False
 

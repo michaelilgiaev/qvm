@@ -115,7 +115,7 @@ def test_do_run_headless_skips_require_viewer(tmp_path, monkeypatch):
     monkeypatch.setattr(vm, "_write_viewer_ask_quit", lambda *a, **k: None)
     monkeypatch.setattr(vm, "select_ssh_port", lambda cfg: None)
 
-    def _fake_launch(cfg, qemu, port, headless=False):
+    def _fake_launch(cfg, qemu, port, headless=False, proxy_plan=None, port_maps=None):
         captured["headless"] = headless
 
     monkeypatch.setattr(vm, "_launch", _fake_launch)

@@ -143,6 +143,7 @@ MODULES=(
     checks command_line_interface configuration configuration_defaults
     configuration_schema configuration_watcher graphics host_resources
     qemu_command ssh_connect virtual_machine vm_instances vm_lifecycle vm_share
+    proxy_config proxy_tunnel proxy_runtime
 )
 INCLUDE_ARGS=()
 for m in "${MODULES[@]}"; do INCLUDE_ARGS+=(--include-module="$m"); done

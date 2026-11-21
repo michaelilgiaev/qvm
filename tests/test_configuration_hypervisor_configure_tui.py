@@ -801,6 +801,8 @@ def test_tui_on_a_pty_edits_every_field_with_real_arrow_keys(tmp_path, monkeypat
     actions = {
         "Share_Host_GPU": b" ",
         "Network": _type_value("none"),
+        "Proxy": _type_value("socks5://127.0.0.1:1080"),
+        "Proxy_Kill_Switch": b" ",
         "Shared": _type_value("/mnt/share"),
         "Clipboard": b" ",
         "Secure_Shell": b" ",
@@ -822,7 +824,7 @@ def test_tui_on_a_pty_edits_every_field_with_real_arrow_keys(tmp_path, monkeypat
             keys += _DOWN
     keys += b"sq"
     rows, cols = 24, 80
-    rc, screen = _drive_pty(tmp_path, keys, timeout=8.0, rows=rows, cols=cols, cli_entry=True)
+    rc, screen = _drive_pty(tmp_path, keys, timeout=12.0, rows=rows, cols=cols, cli_entry=True)
     assert rc == 0, _shown(screen, rows, cols)
     text = path.read_text(encoding="utf-8")
     expected = (
@@ -831,6 +833,8 @@ def test_tui_on_a_pty_edits_every_field_with_real_arrow_keys(tmp_path, monkeypat
         "RAM = 8192\n"
         "Share_Host_GPU = False\n"
         'Network = "none"\n'
+        'Proxy = "socks5://127.0.0.1:1080"\n'
+        "Proxy_Kill_Switch = True\n"
         'Shared = "/mnt/share"\n'
         "Clipboard = True\n"
         "Secure_Shell = True\n"
@@ -851,6 +855,8 @@ def test_tui_on_a_pty_edits_every_field_with_real_arrow_keys(tmp_path, monkeypat
     hcfg = HypervisorCfg.from_dir(str(tmp_path))
     assert hcfg.share_host_gpu is False
     assert hcfg.network == "none"
+    assert hcfg.proxy == "socks5://127.0.0.1:1080"
+    assert hcfg.proxy_kill_switch is True
     assert hcfg.shared == "/mnt/share"
     assert hcfg.clipboard is True
     assert hcfg.secure_shell is True
@@ -877,6 +883,8 @@ def test_tui_on_a_pty_edits_every_field_with_real_arrow_keys(tmp_path, monkeypat
     assert status_rc == 0, status
     assert "codelis-demo" in status
     assert "Network=none" in status
+    assert "socks5://127.0.0.1:1080" in status
+    assert "Proxy_Kill_Switch=True" in status
     assert "Shared=/mnt/share" in status
     assert "Secure_Shell=True" in status
     assert "Ports=22:49400" in status
