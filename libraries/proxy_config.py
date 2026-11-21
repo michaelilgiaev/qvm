@@ -8,9 +8,13 @@ what a lost proxy means:
   * True  -> cut that guest's internet as soon as the proxy stops answering.
              Do not fall through to the host's real route, and do not rotate.
   * False -> keep using a proxy. When the value named a file and the current
-             proxy stops answering, try proxies PARALLEL_ATTEMPTS at a time
-             until one accepts a tunnel, then keep that one. A proxy that
-             still answers is not replaced because another is faster.
+             proxy stops forwarding, try proxies PARALLEL_ATTEMPTS at a time.
+             The whole group is started, and the fastest one that actually
+             carries two verified HTTPS replies at once is kept. The others
+             that also carry them are saved and used, in that speed order,
+             when the current one stops. A handshake alone is not enough, and
+             neither is a proxy that substitutes its own certificate. A proxy
+             that still returns data is not replaced because another is faster.
 
 This module is pure: it reads a file only in load_plan(), and the failover
 decision takes a clock reading instead of sleeping. The network namespace that
@@ -30,10 +34,23 @@ from dataclasses import dataclass
 PROBE_EVERY_S = 1.0
 PROBE_TIMEOUT_S = 8.0
 
-# How many proxies from a proxies file are dialed together when the current one
-# is not known to work. The first tunnel that comes up is kept. The next group
-# is started only when the whole group is down.
+# How many proxies from a proxies file are proved together when none is pinned.
+# The whole group is started before one is chosen. The first proxy that
+# forwards real bytes is kept. The next group starts only when nobody in this
+# group forwarded. A completed handshake is not a win.
 PARALLEL_ATTEMPTS = 10
+
+# A proxy is up when two TLS tunnels to this host both verify the real
+# certificate and come back with a real reply at the same time. Cleartext
+# HTTP is the wrong signal: a proxy that substitutes its own certificate
+# still answers port 80, and the guest's HTTPS then fails. Port 53 is also
+# wrong: plenty of proxies that carry web traffic refuse it, and a proxy
+# that allows only one connection cannot carry a guest. Read at call time
+# so a test can aim the canary elsewhere.
+CANARY_HOST = "1.1.1.1"
+CANARY_PORT = 443
+# None uses the system trust store. A test sets this to a CA it generated.
+CANARY_CAFILE: str | None = None
 
 _OFF = {"", "false", "off", "none", "no", "0"}
 # True selects the proxies file. These spellings match the other bools.

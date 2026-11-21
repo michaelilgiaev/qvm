@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import socket
+import ssl
 import struct
 
 import proxy_config
@@ -203,6 +204,94 @@ def open_tunnel(
     except Exception:
         sock.close()
         raise
+
+
+def _proves_forwarding(payload: bytes) -> bool:
+    """True when `payload` is a real reply from the canary, not an empty read.
+
+    Cloudflare's trace page contains ``fl=``. A redirect from the same host
+    names ``cloudflare`` in the headers. The caller has already checked the
+    certificate, so this body is from that host.
+    """
+    if b"fl=" in payload:
+        return True
+    return b"cloudflare" in payload.lower()
+
+
+def _read_http_proof(sock: socket.socket, timeout: float) -> bool:
+    host = proxy_config.CANARY_HOST
+    request = (
+        f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\n"
+        "User-Agent: qvm\r\nConnection: close\r\n\r\n"
+    ).encode()
+    sock.settimeout(timeout)
+    sock.sendall(request)
+    data = bytearray()
+    while len(data) < 8192:
+        try:
+            chunk = sock.recv(1024)
+        except TimeoutError:
+            return False
+        if not chunk:
+            break
+        data += chunk
+        if _proves_forwarding(bytes(data)):
+            return True
+    return _proves_forwarding(bytes(data))
+
+
+def _tls_context() -> ssl.SSLContext:
+    """Trust store for the canary. A test can add its own CA.
+
+    The system store is what a guest uses for HTTPS. CANARY_CAFILE is extra,
+    so a test certificate verifies and a substituted one still does not.
+    """
+    ctx = ssl.create_default_context()
+    cafile = proxy_config.CANARY_CAFILE
+    if cafile:
+        ctx.load_verify_locations(cafile)
+    return ctx
+
+
+def proxy_forwards(proxy: ProxyEndpoint, timeout: float) -> bool:
+    """True only when `proxy` carries two verified HTTPS replies at once.
+
+    Both tunnels have to finish TLS to the canary and the certificate has to
+    verify. A proxy that substitutes its own certificate is False, the same
+    as one that accepts TCP and then stays silent, refuses the destination,
+    or resets the second connection. The canary host, port, and CA are read
+    here, not at import.
+    """
+    host = proxy_config.CANARY_HOST
+    port = int(proxy_config.CANARY_PORT)
+    opened: list[socket.socket] = []
+    secure: list[ssl.SSLSocket] = []
+    try:
+        for _ in range(2):
+            opened.append(open_tunnel(proxy, host, port, timeout=timeout))
+        ctx = _tls_context()
+        for raw in opened:
+            # open_tunnel clears the timeout. Set it again before the
+            # handshake, or a proxy that accepts and then says nothing hangs.
+            raw.settimeout(timeout)
+            secure.append(ctx.wrap_socket(raw, server_hostname=host))
+        for sock in secure:
+            if not _read_http_proof(sock, timeout):
+                return False
+        return True
+    except OSError:
+        return False
+    finally:
+        for sock in secure:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        for sock in opened:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 def proxy_reachable(proxy: ProxyEndpoint, timeout: float) -> bool:

@@ -105,6 +105,10 @@ def _net_args(cfg: Config, port_maps: "list | None") -> list[str]:
         return []
     if net == "user":
         netdev = "user,id=net0"
+        # The proxy path is IPv4 only. Slirp would otherwise hand the guest an
+        # IPv6 address, and the guest would try it first and hang.
+        if cfg.hcfg.proxy:
+            netdev += ",ipv6=off"
         for guest, host in (port_maps or []):
             netdev += f",hostfwd=tcp::{host}-:{guest}"
         return ["-netdev", netdev, "-device", "virtio-net-pci,netdev=net0"]

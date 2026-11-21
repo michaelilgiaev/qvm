@@ -80,10 +80,13 @@ a running VM applies edits live where it can, and reverts a file with an invalid
                                   "socks5://host:port" | "http://host:port".
                                   The guest's traffic is sent through that proxy.
   Proxy_Kill_Switch               True: a lost proxy cuts this guest's internet
-                                  until the proxy answers. False: with the
-                                  proxies file, try 10 proxies at a time until
-                                  one works, then keep it. A slow proxy that
-                                  still answers is kept.
+                                  until that same proxy forwards again. False:
+                                  with the proxies file, try 10 at a time, keep
+                                  the fastest that carries two connections at
+                                  once, and save the other working ones. A lost
+                                  proxy switches to the next saved one. The
+                                  certificate has to be real. A handshake alone
+                                  is not enough.
   Shared                          False | True (this dir) | an absolute host path
                                   to share into the guest via virtiofs
   Clipboard                       share the clipboard host<->guest (SPICE vdagent)
