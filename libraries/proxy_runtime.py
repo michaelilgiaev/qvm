@@ -16,8 +16,8 @@ it off the host's real route.
 
 Proxy_Kill_Switch closes those tunnels and refuses new ones while the proxy is
 down, then lets them through again once the proxy answers. With the switch off
-and a proxies file, the parent moves one entry down the file after the proxy has
-been unreachable for more than 10 seconds.
+and a proxies file, the parent moves one entry down the file as soon as that
+proxy stops answering. A connect that succeeds is kept, however slow it was.
 
 Host port forwards (SSH and Ports) are published back on the host: QEMU binds
 them inside the namespace, and a unix socket bridges the host listener to that
@@ -541,30 +541,50 @@ class ProxySession:
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._dial_fail(f"bad dial request: {exc}")
             return
-        with self._lock:
-            killed = self._state.killed
-            proxy = None if not self._endpoints else self._endpoints[self._state.index % len(self._endpoints)]
-        if killed or proxy is None:
-            self._dial_fail("proxy kill switch: guest internet is off")
-            return
-        tunnel = None
-        try:
-            tunnel = proxy_tunnel.open_tunnel(proxy, host, port)
+        attempts = 0
+        while True:
             with self._lock:
-                if self._state.killed:
-                    self._dial_fail("proxy kill switch: guest internet is off")
+                killed = self._state.killed
+                count = len(self._endpoints)
+                proxy = None if not count else self._endpoints[self._state.index % count]
+            if killed or proxy is None:
+                self._dial_fail("proxy kill switch: guest internet is off")
+                return
+            tunnel = None
+            try:
+                tunnel = proxy_tunnel.open_tunnel(proxy, host, port)
+                with self._lock:
+                    if self._state.killed:
+                        self._dial_fail("proxy kill switch: guest internet is off")
+                        return
+                _send_fd(sock, tunnel.fileno(), b'{"ok":true}\n')
+                return
+            except proxy_tunnel.ProxyDown as exc:
+                # The proxy itself died. Try the next URL in this same dial so
+                # the guest does not have to time out and reconnect. A slow
+                # tunnel, or a destination the proxy refused, is not ProxyDown
+                # and falls through to the handler below.
+                self._note_current(proxy, False)
+                attempts += 1
+                with self._lock:
+                    still_here = bool(self._endpoints) and (
+                        self._endpoints[self._state.index % len(self._endpoints)] == proxy
+                    )
+                    killed_now = self._state.killed
+                if killed_now or still_here or attempts >= max(count, 1):
+                    self._dial_fail(str(exc))
                     return
-            _send_fd(sock, tunnel.fileno(), b'{"ok":true}\n')
-        except OSError as exc:
-            self._dial_fail(str(exc))
-        finally:
-            # sendmsg duplicated the fd into the namespace. Drop our copy either
-            # way; the supervisor owns the one the guest is spliced to.
-            if tunnel is not None:
-                try:
-                    tunnel.close()
-                except OSError:
-                    pass
+            except OSError as exc:
+                self._dial_fail(str(exc))
+                return
+            finally:
+                # sendmsg duplicated the fd into the namespace. Drop our copy
+                # either way; the supervisor owns the one the guest is spliced to.
+                if tunnel is not None:
+                    try:
+                        tunnel.close()
+                    except OSError:
+                        pass
 
     def _dial_fail(self, message: str) -> None:
         if self._dial is None:
@@ -592,29 +612,37 @@ class ProxySession:
             endpoints = self._refresh_endpoints()
             if endpoints:
                 with self._lock:
-                    state = self._state
-                    if state.index >= len(endpoints):
-                        state = HealthState(0, state.down_since, state.killed)
-                        self._state = state
-                    proxy = endpoints[state.index]
+                    proxy = endpoints[self._state.index % len(endpoints)]
                 ok = proxy_tunnel.proxy_reachable(proxy, proxy_config.PROBE_TIMEOUT_S)
-                now = time.monotonic()
-                new_state, action = proxy_config.note_probe(
-                    state,
-                    ok=ok,
-                    now=now,
-                    kill_switch=self.kill_switch,
-                    from_file=self.plan.from_file,
-                    count=len(endpoints),
-                    failover_after=proxy_config.FAILOVER_AFTER_S,
-                )
-                self._apply(new_state, action, endpoints)
+                self._note_current(proxy, ok)
             wait = proxy_config.PROBE_EVERY_S - (time.monotonic() - started)
             if self._stop.wait(max(0.0, wait)):
                 return
 
-    def _apply(self, new_state: HealthState, action: str, endpoints: tuple) -> None:
+    def _note_current(self, proxy: ProxyEndpoint, ok: bool) -> None:
+        """Record one result for `proxy`, but only if it is still current.
+
+        A probe that started before a switch must not mark the new proxy down,
+        and a second failure of the same proxy must not switch twice.
+        """
         with self._lock:
+            endpoints = self._endpoints
+            if not endpoints:
+                return
+            state = self._state
+            if state.index >= len(endpoints):
+                state = HealthState(0, state.down_since, state.killed)
+            current = endpoints[state.index % len(endpoints)]
+            if current != proxy:
+                return
+            new_state, action = proxy_config.note_probe(
+                state,
+                ok=ok,
+                now=time.monotonic(),
+                kill_switch=self.kill_switch,
+                from_file=self.plan.from_file,
+                count=len(endpoints),
+            )
             self._state = new_state
         if action == "kill":
             print("Proxy connection lost -- kill switch, guest internet cut.", file=sys.stderr)
@@ -624,11 +652,7 @@ class ProxySession:
             print("Proxy is answering again -- guest internet restored.", file=sys.stderr)
         elif action == "switch":
             chosen = endpoints[new_state.index % len(endpoints)]
-            print(
-                f"Proxy unreachable for more than {proxy_config.FAILOVER_AFTER_S:g}s "
-                f"-- switching to {chosen.render()}.",
-                file=sys.stderr,
-            )
+            print(f"Proxy stopped answering -- switching to {chosen.render()}.", file=sys.stderr)
 
     def _listen_forward(self, host_port: int) -> None:
         """Publish one guest hostfwd port on the real host."""

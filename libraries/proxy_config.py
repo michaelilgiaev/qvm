@@ -8,8 +8,8 @@ what a lost proxy means:
   * True  -> cut that guest's internet as soon as the proxy stops answering.
              Do not fall through to the host's real route, and do not rotate.
   * False -> keep using a proxy. When the value named a file and the current
-             proxy has been down for more than 10 seconds, move to the next
-             URL in the file.
+             proxy stops answering, move to the next URL in the file at once.
+             A proxy that answers slowly is still answering, so it stays.
 
 This module is pure: it reads a file only in load_plan(), and the failover
 decision takes a clock reading instead of sleeping. The network namespace that
@@ -22,13 +22,13 @@ import os
 import re
 from dataclasses import dataclass
 
-# A lost proxy is rotated only once it has been unreachable for MORE than this
-# many seconds. The kill switch does not wait and does not rotate.
-FAILOVER_AFTER_S = 10.0
-
-# How often the running gateway asks the current proxy if it is still up.
+# How often the running gateway asks the current proxy if it is still up, and
+# how long that connect may take. A connect that finishes inside the window is
+# a live proxy no matter how slow it was. A refused connection fails at once
+# and, with a proxies file, the next URL is used immediately. The window is
+# long enough that one slow reply is not mistaken for a dead proxy.
 PROBE_EVERY_S = 1.0
-PROBE_TIMEOUT_S = 2.0
+PROBE_TIMEOUT_S = 8.0
 
 _OFF = {"", "false", "off", "none", "no", "0"}
 # True selects the proxies file. These spellings match the other bools.
@@ -226,15 +226,15 @@ def note_probe(
     kill_switch: bool,
     from_file: bool,
     count: int,
-    failover_after: float = FAILOVER_AFTER_S,
 ) -> tuple[HealthState, str]:
-    """PURE. Fold one reachability probe into `state`.
+    """PURE. Fold one reachability result into `state`.
 
     Returns (new_state, action). action is `none`, `kill`, `restore`, or
-    `switch`. A kill switch cuts the guest on the first failed probe and never
-    rotates. Without it, a proxies file rotates only after the current proxy
-    has been down for more than `failover_after` seconds. A single URL has
-    nowhere to rotate to, so it stays put until it answers again.
+    `switch`. `ok` means the proxy answered. How long that took is not an
+    input: a slow answer is still an answer. A kill switch cuts the guest on
+    the first failure and never rotates. Without it, a proxies file with more
+    than one URL rotates on that same failure. A single URL has nowhere to
+    rotate to, so it stays put until it answers again.
     """
     if count < 1:
         return state, "none"
@@ -246,6 +246,6 @@ def note_probe(
     if kill_switch:
         action = "none" if state.killed else "kill"
         return HealthState(index, down_since, True), action
-    if from_file and count > 1 and (now - down_since) > failover_after:
-        return HealthState((index + 1) % count, now, False), "switch"
+    if from_file and count > 1:
+        return HealthState((index + 1) % count, None, False), "switch"
     return HealthState(index, down_since, False), "none"

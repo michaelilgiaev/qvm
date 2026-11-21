@@ -12,6 +12,7 @@ import base64
 import socket
 import struct
 
+import proxy_config
 from proxy_config import ProxyEndpoint
 
 
@@ -19,38 +20,68 @@ class ProxyTunnelError(ConnectionError):
     """The proxy answered, but refused the tunnel."""
 
 
+class ProxyDown(ProxyTunnelError):
+    """The proxy itself is gone or is not speaking its protocol.
+
+    A slow answer is not this, and neither is a normal rejection of the
+    destination (SOCKS reply code, HTTP status). Those keep the current proxy.
+    """
+
+
 def recvall(sock: socket.socket, count: int) -> bytes:
-    """Read exactly `count` bytes, or raise if the peer closes early."""
+    """Read exactly `count` bytes, or raise if the peer closes early.
+
+    A timeout is left as TimeoutError: the proxy accepted and is merely slow,
+    or it is still dialing the destination. A reset or an early close is
+    ProxyDown, because the proxy itself dropped the session.
+    """
     buf = bytearray()
     while len(buf) < count:
-        chunk = sock.recv(count - len(buf))
+        try:
+            chunk = sock.recv(count - len(buf))
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            raise ProxyDown(f"proxy closed the connection: {exc}") from exc
         if not chunk:
-            raise ConnectionError("connection closed")
+            raise ProxyDown("proxy closed the connection")
         buf += chunk
     return bytes(buf)
 
 
 def _socks5_auth(sock: socket.socket, username: str, password: str) -> None:
-    if username:
-        sock.sendall(b"\x05\x02\x00\x02")
-    else:
-        sock.sendall(b"\x05\x01\x00")
-    version, method = recvall(sock, 2)
-    if version != 5:
-        raise ProxyTunnelError(f"proxy is not SOCKS5 (version {version})")
-    if method == 0xFF:
-        raise ProxyTunnelError("proxy rejected every auth method")
-    if method == 0x02:
-        user = username.encode()
-        secret = password.encode()
-        if len(user) > 255 or len(secret) > 255:
-            raise ProxyTunnelError("SOCKS5 username or password is too long")
-        sock.sendall(bytes((0x01, len(user))) + user + bytes((len(secret),)) + secret)
-        auth_ver, status = recvall(sock, 2)
-        if auth_ver != 0x01 or status != 0x00:
-            raise ProxyTunnelError("SOCKS5 username/password rejected")
-    elif method != 0x00:
-        raise ProxyTunnelError(f"SOCKS5 auth method {method} is not supported")
+    """Greeting and auth. This is the proxy itself, not the destination.
+
+    The budget is the probe window. A proxy that accepts TCP and then never
+    speaks is down. One that answers inside the window is up, however slow.
+    """
+    previous = sock.gettimeout()
+    sock.settimeout(proxy_config.PROBE_TIMEOUT_S)
+    try:
+        if username:
+            sock.sendall(b"\x05\x02\x00\x02")
+        else:
+            sock.sendall(b"\x05\x01\x00")
+        version, method = recvall(sock, 2)
+        if version != 5:
+            raise ProxyDown(f"proxy is not SOCKS5 (version {version})")
+        if method == 0xFF:
+            raise ProxyDown("proxy rejected every auth method")
+        if method == 0x02:
+            user = username.encode()
+            secret = password.encode()
+            if len(user) > 255 or len(secret) > 255:
+                raise ProxyTunnelError("SOCKS5 username or password is too long")
+            sock.sendall(bytes((0x01, len(user))) + user + bytes((len(secret),)) + secret)
+            auth_ver, status = recvall(sock, 2)
+            if auth_ver != 0x01 or status != 0x00:
+                raise ProxyDown("SOCKS5 username/password rejected")
+        elif method != 0x00:
+            raise ProxyDown(f"SOCKS5 auth method {method} is not supported")
+    except TimeoutError as exc:
+        raise ProxyDown("SOCKS5 proxy did not answer") from exc
+    finally:
+        sock.settimeout(previous)
 
 
 def _socks5_request(host: str, port: int) -> bytes:
@@ -125,9 +156,14 @@ def http_connect(
     sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
     data = bytearray()
     while b"\r\n\r\n" not in data:
-        chunk = sock.recv(1)
+        try:
+            chunk = sock.recv(1)
+        except TimeoutError:
+            raise
+        except OSError as exc:
+            raise ProxyDown(f"HTTP proxy closed during CONNECT: {exc}") from exc
         if not chunk:
-            raise ConnectionError("proxy closed during CONNECT")
+            raise ProxyDown("HTTP proxy closed during CONNECT")
         data += chunk
         if len(data) > 65536:
             raise ProxyTunnelError("proxy CONNECT response is too large")
@@ -145,7 +181,15 @@ def open_tunnel(
     The caller owns the socket. On any failure the socket is closed and the
     error propagates -- a half-open proxy socket must not be relayed.
     """
-    sock = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
+    # The connect budget is the probe window, not `timeout`. `timeout` covers
+    # the destination the proxy dials after it has answered. A connect that
+    # finishes inside the window keeps this proxy; how long it took does not.
+    try:
+        sock = socket.create_connection(
+            (proxy.host, proxy.port), timeout=proxy_config.PROBE_TIMEOUT_S,
+        )
+    except OSError as exc:
+        raise ProxyDown(f"proxy is not answering: {exc}") from exc
     try:
         sock.settimeout(timeout)
         if proxy.scheme == "socks4":
@@ -162,11 +206,12 @@ def open_tunnel(
 
 
 def proxy_reachable(proxy: ProxyEndpoint, timeout: float) -> bool:
-    """True when a TCP handshake to the proxy itself succeeds.
+    """True when a TCP handshake to the proxy itself finishes.
 
-    This is the 'proxy connection' the kill switch and the 10 second failover
-    watch. It does not open a tunnel, so a probe cannot be confused with guest
-    traffic.
+    Latency is not a failure: any handshake that completes inside `timeout`
+    is success, however long it took. Connection refused fails immediately,
+    which is a dead proxy. This does not open a tunnel, so a probe cannot be
+    confused with guest traffic, and it does not rank proxies by speed.
     """
     try:
         sock = socket.create_connection((proxy.host, proxy.port), timeout=timeout)

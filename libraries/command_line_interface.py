@@ -81,8 +81,9 @@ a running VM applies edits live where it can, and reverts a file with an invalid
                                   The guest's traffic is sent through that proxy.
   Proxy_Kill_Switch               True: a lost proxy cuts this guest's internet
                                   until the proxy answers. False: with the
-                                  proxies file, switch to the next URL after
-                                  10 seconds.
+                                  proxies file, switch to the next URL as soon
+                                  as this one stops answering. A slow proxy
+                                  that still answers is kept.
   Shared                          False | True (this dir) | an absolute host path
                                   to share into the guest via virtiofs
   Clipboard                       share the clipboard host<->guest (SPICE vdagent)
