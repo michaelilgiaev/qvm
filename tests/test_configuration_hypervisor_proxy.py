@@ -46,13 +46,16 @@ def test_proxy_off_spellings(raw):
 
 
 @pytest.mark.parametrize("raw", ["True", "true", "yes", "on", "1", '"True"'])
-def test_proxy_rejects_boolean_on(raw):
-    _vals, errors = cs.coerce_all({"Proxy": raw})
-    assert errors
+def test_proxy_true_selects_the_proxies_file(raw):
+    vals, errors = cs.coerce_all({"Proxy": raw})
+    assert not errors
+    assert vals["Proxy"] is True
 
 
 @pytest.mark.parametrize("raw", [
     "socks5://127.0.0.1:1080",
+    "socks4://203.99.183.197:1080",
+    "socks4://user@186.1.182.194:4153",
     "http://proxy.example:8080",
     "SOCKS5://example.com:1080",
     "socks5://alice:secret@10.1.1.1:1080",
@@ -112,6 +115,9 @@ def test_from_dir_reads_proxy_and_env_wins(tmp_path, monkeypatch):
     hcfg = HypervisorCfg.from_dir(str(tmp_path))
     assert hcfg.proxy == "proxies"
     assert hcfg.proxy_kill_switch is True
+    monkeypatch.setenv("PROXY", "True")
+    hcfg = HypervisorCfg.from_dir(str(tmp_path))
+    assert hcfg.proxy is True
 
 
 def test_defaults_leave_proxy_off(tmp_path):
@@ -124,14 +130,18 @@ def test_defaults_leave_proxy_off(tmp_path):
 
 def test_load_plan_skips_blanks_and_comments(tmp_path):
     (tmp_path / "proxies").write_text(
-        "\n# comment\nsocks5://127.0.0.1:1\n\nhttp://127.0.0.1:2\n",
+        "\n# comment\nsocks4://127.0.0.1:9\nsocks5://127.0.0.1:1\n\nhttp://127.0.0.1:2\n",
         encoding="utf-8",
     )
     plan = proxy_config.load_plan(str(tmp_path), "proxies")
     assert plan.enabled and plan.from_file and plan.source == "proxies"
-    assert [(e.scheme, e.port) for e in plan.endpoints] == [("socks5", 1), ("http", 2)]
+    assert [(e.scheme, e.port) for e in plan.endpoints] == [
+        ("socks4", 9), ("socks5", 1), ("http", 2),
+    ]
+    same = proxy_config.load_plan(str(tmp_path), True)
+    assert same == plan
     text = proxy_config.describe(plan, False)
-    assert "file proxies (2 proxies)" in text
+    assert "file proxies (3 proxies)" in text
     assert "Kill switch: off" in text
 
 
@@ -219,6 +229,72 @@ def _recvall(sock: socket.socket, count: int) -> bytes:
             raise ConnectionError("closed")
         buf += chunk
     return bytes(buf)
+
+
+def test_socks4_handshake_leaves_the_first_payload_byte():
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    seen = {}
+
+    def run():
+        conn, _addr = listener.accept()
+        try:
+            head = _recvall(conn, 8)
+            version, command, dest_port, packed = struct.unpack("!BBH4s", head)
+            user = bytearray()
+            while True:
+                byte = _recvall(conn, 1)
+                if byte == b"\x00":
+                    break
+                user += byte
+            seen["version"] = version
+            seen["command"] = command
+            seen["user"] = bytes(user).decode()
+            seen["dest"] = (socket.inet_ntoa(packed), dest_port)
+            conn.sendall(b"\x00\x5a\x00\x00\x00\x00\x00\x00Z")
+        finally:
+            time.sleep(1)
+            conn.close()
+            listener.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    proxy = parse_endpoint(f"socks4://bob@127.0.0.1:{port}")
+    assert proxy is not None
+    sock = proxy_tunnel.open_tunnel(proxy, "203.0.113.10", 80, timeout=3)
+    try:
+        assert sock.recv(1) == b"Z"
+    finally:
+        sock.close()
+    assert seen["version"] == 4 and seen["command"] == 1
+    assert seen["user"] == "bob"
+    assert seen["dest"] == ("203.0.113.10", 80)
+
+
+def test_socks4_refuses_a_name_and_a_denied_connect():
+    with pytest.raises(proxy_tunnel.ProxyTunnelError, match="IPv4"):
+        proxy_tunnel.socks4_connect(socket.socket(), "example.com", 80)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def run():
+        conn, _addr = listener.accept()
+        while conn.recv(1) != b"\x00":
+            pass
+        conn.sendall(b"\x00\x5b\x00\x00\x00\x00\x00\x00")
+        time.sleep(0.2)
+        conn.close()
+        listener.close()
+
+    threading.Thread(target=run, daemon=True).start()
+    proxy = parse_endpoint(f"socks4://127.0.0.1:{port}")
+    assert proxy is not None
+    with pytest.raises(proxy_tunnel.ProxyTunnelError, match="reply 91"):
+        proxy_tunnel.open_tunnel(proxy, "203.0.113.10", 80, timeout=3)
 
 
 def test_socks5_handshake_leaves_the_first_payload_byte():
@@ -326,7 +402,7 @@ def test_open_tunnel_closes_when_the_proxy_refuses():
 # --- namespace ---------------------------------------------------------------
 
 class _Proxy:
-    """A localhost SOCKS5 or HTTP proxy that records destinations and answers.
+    """A localhost SOCKS4, SOCKS5, or HTTP proxy that records destinations.
 
     Port 53 is answered as DNS-over-TCP. Anything else is one ping/pong exchange
     with an echo socket, so the payload is not generated by the proxy itself.
@@ -411,6 +487,8 @@ class _Proxy:
             conn.settimeout(3)
             if self.scheme == "socks5":
                 dest = self._socks(conn)
+            elif self.scheme == "socks4":
+                dest = self._socks4(conn)
             else:
                 dest = self._http(conn)
             if dest is None:
@@ -448,6 +526,15 @@ class _Proxy:
         port = struct.unpack("!H", _recvall(conn, 2))[0]
         conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
         return host, port
+
+    def _socks4(self, conn: socket.socket):
+        version, command, port, packed = struct.unpack("!BBH4s", _recvall(conn, 8))
+        while _recvall(conn, 1) != b"\x00":
+            pass
+        if version != 4 or command != 1:
+            return None
+        conn.sendall(b"\x00\x5a\x00\x00\x00\x00\x00\x00")
+        return socket.inet_ntoa(packed), port
 
     def _http(self, conn: socket.socket):
         data = bytearray()
@@ -538,7 +625,7 @@ def _wait(pred, timeout: float, detail: str) -> None:
     raise AssertionError(detail)
 
 
-@pytest.mark.parametrize("scheme", ["socks5", "http"])
+@pytest.mark.parametrize("scheme", ["socks4", "socks5", "http"])
 def test_guest_tcp_goes_through_the_proxy(tmp_path, scheme, monkeypatch):
     monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 0.1)
     monkeypatch.setattr(proxy_config, "PROBE_TIMEOUT_S", 0.3)

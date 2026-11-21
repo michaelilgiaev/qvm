@@ -8,8 +8,8 @@ only way those packets leave is a socket the parent dials *to the proxy* (the
 parent still lives in the host namespace, so it can reach the proxy, and the
 connected fd is passed back with SCM_RIGHTS).
 
-Nothing is forwarded except through that dial. TCP goes through SOCKS5 or HTTP
-CONNECT. DNS (UDP/53) is carried as DNS-over-TCP through the same proxy, and the
+Nothing is forwarded except through that dial. TCP goes through SOCKS4, SOCKS5,
+or HTTP CONNECT. DNS (UDP/53) is carried as DNS-over-TCP through the same proxy, and the
 reply is written back so the guest still thinks it heard its resolver. Any other
 UDP is discarded: an HTTP proxy cannot carry it, and dropping it is what keeps
 it off the host's real route.

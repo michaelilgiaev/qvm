@@ -1,9 +1,9 @@
 """proxy_config.py - proxy URL / proxies-file parsing and the failover decision.
 
-hypervisor.cfg `Proxy` is either off, one URL (`socks5://host:port` or
-`http://host:port`), or the name of a file sitting next to hypervisor.cfg
-(the usual name is `proxies`) with one URL per line. `Proxy_Kill_Switch`
-decides what a lost proxy means:
+hypervisor.cfg `Proxy` is off (`False`), `True` (the file named `proxies`
+next to hypervisor.cfg, one URL per line), one URL (`socks4://`, `socks5://`,
+or `http://`), or that same kind of file name. `Proxy_Kill_Switch` decides
+what a lost proxy means:
 
   * True  -> cut that guest's internet as soon as the proxy stops answering.
              Do not fall through to the host's real route, and do not rotate.
@@ -31,13 +31,21 @@ PROBE_EVERY_S = 1.0
 PROBE_TIMEOUT_S = 2.0
 
 _OFF = {"", "false", "off", "none", "no", "0"}
-# A proxy is a URL or a file name. True/yes/1 would otherwise look like a file.
+# True selects the proxies file. These spellings match the other bools.
 _ON = {"true", "on", "yes", "1"}
 
-# socks5://host:port or http://host:port, optional user:pass@. IPv6 in brackets.
+# The file Proxy=True reads. It sits next to hypervisor.cfg.
+PROXIES_FILE = "proxies"
+
+_SPEC_ERROR = (
+    'must be False, True (the proxies file), a socks4://, socks5://, or '
+    'http:// URL, or a file name such as "proxies"'
+)
+
+# socks4/socks5/http host:port, optional user or user:pass@. IPv6 in brackets.
 _URL_RE = re.compile(
-    r"^(?P<scheme>socks5|http)://"
-    r"(?:(?P<user>[^:@/\s]+):(?P<password>[^@/\s]+)@)?"
+    r"^(?P<scheme>socks4|socks5|http)://"
+    r"(?:(?P<user>[^:@/\s]+)(?::(?P<password>[^@/\s]*))?@)?"
     r"(?P<host>\[[0-9A-Fa-f:.]+\]|[^:/\s]+)"
     r":(?P<port>[0-9]{1,5})$",
     re.IGNORECASE,
@@ -50,7 +58,7 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 @dataclass(frozen=True)
 class ProxyEndpoint:
-    """One upstream proxy. `scheme` is `socks5` or `http`."""
+    """One upstream proxy. `scheme` is `socks4`, `socks5`, or `http`."""
 
     scheme: str
     host: str
@@ -95,7 +103,7 @@ def _unquote(raw: str) -> str:
 
 
 def parse_endpoint(url: str) -> "ProxyEndpoint | None":
-    """Parse one proxy URL, or None when it is not a socks5/http URL."""
+    """Parse one proxy URL, or None when it is not a socks4/socks5/http URL."""
     match = _URL_RE.match(url.strip())
     if not match:
         return None
@@ -119,37 +127,26 @@ def parse_endpoint(url: str) -> "ProxyEndpoint | None":
 def coerce_proxy_spec(raw) -> tuple[bool, object, str]:
     """Schema coercer for `Proxy`. (ok, value, error).
 
-    Value is False when the proxy is off, or the original URL / file name
-    string when it is on. The file itself is not opened here -- the schema
-    stays free of I/O, and a missing file is reported at boot.
+    Value is False when the proxy is off, True when it should read the
+    `proxies` file, or the original URL / file name string. The file itself
+    is not opened here -- the schema stays free of I/O, and a missing file
+    is reported at boot.
     """
     if not isinstance(raw, str):
-        return False, None, (
-            'must be False, a proxy URL like "socks5://host:port", '
-            'or a file name such as "proxies"'
-        )
+        return False, None, _SPEC_ERROR
     text = _unquote(raw)
     low = text.lower()
     if low in _OFF:
         return True, False, ""
     if low in _ON:
-        return False, None, (
-            'must be False, a proxy URL like "socks5://host:port", '
-            'or a file name such as "proxies"'
-        )
+        return True, True, ""
     if "://" in text:
         if parse_endpoint(text) is None:
-            return False, None, (
-                'must be a socks5://host:port or http://host:port URL '
-                "(or a file name such as proxies)"
-            )
+            return False, None, _SPEC_ERROR
         return True, text, ""
     if _NAME_RE.match(text):
         return True, text, ""
-    return False, None, (
-        'must be False, a proxy URL like "socks5://host:port", '
-        'or a file name such as "proxies"'
-    )
+    return False, None, _SPEC_ERROR
 
 
 def parse_proxy_list(text: str) -> tuple[list[ProxyEndpoint], list[str]]:
@@ -166,7 +163,7 @@ def parse_proxy_list(text: str) -> tuple[list[ProxyEndpoint], list[str]]:
         endpoint = parse_endpoint(line)
         if endpoint is None:
             errors.append(
-                f"line {number}: expected socks5://host:port or http://host:port, got {line!r}"
+                f"line {number}: expected socks4://, socks5://, or http://host:port, got {line!r}"
             )
             continue
         endpoints.append(endpoint)
@@ -177,16 +174,23 @@ def load_plan(directory: str, spec) -> ProxyPlan:
     """Resolve a coerced Proxy value against `directory`.
 
     Raises FileNotFoundError or ValueError when a named file is missing, empty,
-    or contains a bad line. A False spec returns a disabled plan.
+    or contains a bad line. A False spec returns a disabled plan. True reads
+    the file named `proxies`.
     """
     if spec is False or spec is None or spec == "":
         return ProxyPlan(False, False, "", ())
+    if spec is True:
+        return _plan_from_file(directory, PROXIES_FILE)
     if "://" in str(spec):
         endpoint = parse_endpoint(str(spec))
         if endpoint is None:
             raise ValueError(f"invalid proxy URL: {spec}")
         return ProxyPlan(True, False, "", (endpoint,))
-    name = str(spec)
+    return _plan_from_file(directory, str(spec))
+
+
+def _plan_from_file(directory: str, name: str) -> ProxyPlan:
+    """Read `name` from `directory` into a plan that may fail over."""
     path = os.path.join(directory, name)
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:

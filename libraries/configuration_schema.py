@@ -25,7 +25,7 @@ Type model (per key):
   bool     : Share_Host_GPU, Clipboard, Secure_Shell, Fullscreen,
              Ask_Before_Quitting_Hypervisor, Audio, Proxy_Kill_Switch
   string   : Network              (user | none | <interface name>)
-  proxy    : Proxy                (False | socks5:// or http:// URL | a file name)
+  proxy    : Proxy                (False | True = proxies file | socks4/5 or http URL | a file name)
   shared   : Shared               (False | True/empty = working dir | /abs/path)
   usb      : USB                  (False/empty | /dev/... [more /dev/...])
   ports    : Ports                (guest:host maps; the 22:host map is the ssh forward)
@@ -173,9 +173,9 @@ _IFACE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
 
 
 def _coerce_proxy(raw):
-    """False/off -> no proxy. A socks5:// or http:// URL, or a file name (no
-    slash) that lives next to hypervisor.cfg, such as `proxies`. The file is
-    not opened here; booting reads it."""
+    """False/off -> no proxy. True -> the proxies file beside hypervisor.cfg.
+    A socks4://, socks5://, or http:// URL is one proxy. A file name (no slash)
+    is that file. The file is not opened here; booting reads it."""
     return proxy_config.coerce_proxy_spec(raw)
 
 

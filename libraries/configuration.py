@@ -78,8 +78,9 @@ _CFG_HEADER = (
     ' maps ("22:49156, 1500:49157").\n'
     "### USB: False or device path(s) (\"lsusb\", \"lsblk -o NAME,TRAN,MOUNTPOINT\")."
     " Edits apply live where they can.\n"
-    '### Proxy: False | "socks5://host:port" | "http://host:port" | a file name beside this'
-    " file (one URL per line). Proxy_Kill_Switch cuts guest internet when that proxy drops.\n"
+    '### Proxy: False | True (the proxies file beside this file) | "socks4://host:port"'
+    ' | "socks5://host:port" | "http://host:port". Proxy_Kill_Switch cuts guest internet'
+    " when that proxy drops.\n"
 )
 
 
@@ -156,7 +157,7 @@ def resolve_sizes(vals: dict, directory: str) -> None:
 class HypervisorCfg:
     share_host_gpu: bool
     network: str
-    proxy: "bool | str"   # False, a socks5/http URL, or a file name beside hypervisor.cfg
+    proxy: "bool | str"   # False | True (proxies file) | socks4/socks5/http URL | file name
     proxy_kill_switch: bool
     shared: "bool | str"
     clipboard: bool

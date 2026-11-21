@@ -1,4 +1,4 @@
-"""proxy_tunnel.py - open one TCP stream through a SOCKS5 or HTTP proxy.
+"""proxy_tunnel.py - open one TCP stream through a SOCKS4, SOCKS5, or HTTP proxy.
 
 The guest never speaks this protocol. proxy_runtime captures the guest's own
 TCP (and DNS) and asks this module to dial the destination through whatever
@@ -79,6 +79,27 @@ def _socks5_reply(sock: socket.socket) -> None:
         raise ProxyTunnelError(f"SOCKS5 connect failed (reply {reply})")
 
 
+def socks4_connect(
+    sock: socket.socket, host: str, port: int, username: str = ""
+) -> None:
+    """SOCKS4 CONNECT. The userid is `username` (SOCKS4 has no password).
+
+    The request carries a 4-byte IPv4 address, which is what a captured guest
+    packet always is. A name or an IPv6 destination cannot be encoded.
+    """
+    try:
+        packed = socket.inet_aton(host)
+    except OSError:
+        raise ProxyTunnelError("SOCKS4 can only connect to an IPv4 address") from None
+    user = username.encode()
+    if b"\x00" in user or len(user) > 255:
+        raise ProxyTunnelError("SOCKS4 userid is too long or contains a NUL")
+    sock.sendall(b"\x04\x01" + struct.pack("!H", port) + packed + user + b"\x00")
+    _version, reply, _port, _ip = struct.unpack("!BBH4s", recvall(sock, 8))
+    if reply != 90:
+        raise ProxyTunnelError(f"SOCKS4 connect failed (reply {reply})")
+
+
 def socks5_connect(
     sock: socket.socket, host: str, port: int, username: str = "", password: str = ""
 ) -> None:
@@ -127,7 +148,9 @@ def open_tunnel(
     sock = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
     try:
         sock.settimeout(timeout)
-        if proxy.scheme == "socks5":
+        if proxy.scheme == "socks4":
+            socks4_connect(sock, host, port, proxy.username)
+        elif proxy.scheme == "socks5":
             socks5_connect(sock, host, port, proxy.username, proxy.password)
         else:
             http_connect(sock, host, port, proxy.username, proxy.password)
