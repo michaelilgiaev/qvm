@@ -55,6 +55,14 @@ CMD_NAME = "proxy.cmd"
 RESPONSIVE_S = 0.8
 DURABLE_OK = 3
 DURABLE_S = 8.0
+# A proxy is proven after this many successes in a row, and only while its
+# last success is still this recent. Failover prefers those. The background
+# tester keeps rechecking them so the set stays honest.
+PROVEN_OK = 2
+FRESH_S = 12.0
+# How many of the best saved proxies each background wave rechecks. The rest
+# of the wave keeps walking the file for new ones.
+SAVED_RECHECK = 10
 
 
 @dataclass(frozen=True)
@@ -137,30 +145,47 @@ def health_rank(label: str) -> int:
     return {"durable": 0, "responsive": 1, "slow": 2, "unproven": 3, "down": 4}.get(label, 5)
 
 
+def is_proven(record: "ProxyRecord | None", now: float) -> bool:
+    """True when this proxy has answered more than once and was checked recently."""
+    if record is None or record.last_ok is None or record.streak_ok < PROVEN_OK:
+        return False
+    if health_label(record, now) == "down":
+        return False
+    return (now - record.last_ok) <= FRESH_S
+
+
 def selection_key(record: "ProxyRecord | None", now: float) -> tuple:
     """Sort key for which proxy carries the guest. Lower wins.
 
-    A proxy whose latest check failed sorts last. Every other proxy sorts by
-    its latest latency, so the fastest measured one is first. Durability is
-    reported, and it does not outrank a faster reply.
+    A proxy whose latest check failed sorts last. Among the rest, one that has
+    kept answering beats a single lucky sample, and the fastest of those goes
+    first. Over time the guest settles on a proxy that is both quick and still
+    alive.
     """
     label = health_label(record, now)
-    latency = None if record is None else record.latency
-    return (1 if label == "down" else 0, latency if latency is not None else 1e9)
+    latency = None if record is None or record.latency is None else record.latency
+    return (
+        1 if label == "down" else 0,
+        0 if is_proven(record, now) else 1,
+        latency if latency is not None else 1e9,
+    )
 
 
-def should_promote(current_s: "float | None", candidate_s: "float | None") -> bool:
-    """True when `candidate_s` is fast enough to replace the proxy in use.
+def should_promote(
+    current_s: "float | None",
+    candidate_s: "float | None",
+    *,
+    candidate_proven: bool = True,
+) -> bool:
+    """True when `candidate_s` should replace the proxy in use.
 
-    Fifty milliseconds of noise does not move the guest. A clearly faster
-    measurement does.
+    An unproven sample does not take a live stream. A proven replacement has
+    to be clearly faster, not a few milliseconds ahead.
     """
-    if candidate_s is None:
+    if not candidate_proven or candidate_s is None:
         return False
     if current_s is None:
         return True
-    # A small edge is not worth moving a guest that already has a stream.
-    # The replacement has to be clearly faster.
     return candidate_s + 0.1 < current_s * 0.8
 
 # How many proxies from a proxies file are proved together when none is pinned.

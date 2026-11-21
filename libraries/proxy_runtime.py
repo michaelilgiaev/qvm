@@ -1413,18 +1413,24 @@ class ProxySession:
             by_key = {self._proxy_key(ep): ep for ep in endpoints}
             inflight = set(self._inflight)
             cursor = self._pool_cursor
+            now = time.monotonic()
+            saved.sort(key=lambda key: proxy_config.selection_key(self._ledger.get(key), now))
+        # Recheck the proxies a failure would actually switch to, and spend the
+        # rest of the wave looking for new ones. A full saved list must not
+        # stop the file walk.
+        saved_room = min(proxy_config.SAVED_RECHECK, max(0, room // 2))
         chosen: list = []
         seen: set = set(inflight)
         if current_key is not None:
             seen.add(current_key)
         for key in saved:
+            if len(chosen) >= saved_room:
+                break
             proxy = by_key.get(key)
             if proxy is None or key in seen:
                 continue
             seen.add(key)
             chosen.append(proxy)
-            if len(chosen) >= room:
-                return chosen
         count = len(endpoints)
         if count < 1:
             return chosen
@@ -1509,7 +1515,12 @@ class ProxySession:
             if pinned and not self._pinned:
                 return
             candidate = next((lat for lat, item in self._working if item == key), None)
-        if pinned and not proxy_config.should_promote(current_latency, candidate):
+        with self._lock:
+            candidate_record = self._ledger.get(key)
+        proven = proxy_config.is_proven(candidate_record, time.monotonic())
+        if pinned and not proxy_config.should_promote(
+            current_latency, candidate, candidate_proven=proven,
+        ):
             return
         self._pin_forwarding(nxt, proxy)
         self._note = f"Faster proxy {proxy.render()}."

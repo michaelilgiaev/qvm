@@ -298,18 +298,25 @@ def test_note_probe_success_clears_the_down_timer():
     assert action == "none" and state.down_since is None and state.index == 1 and not state.killed
 
 
-def test_the_fastest_proxy_sorts_ahead_of_a_slower_durable_one():
-    """Latency picks the proxy. A long uptime does not beat a faster reply."""
+def test_failover_prefers_a_fast_proxy_that_has_kept_answering():
+    """A repeated fast proxy beats one lucky sample and a slower proven one."""
     now = 100.0
-    quick = proxy_config.ProxyRecord(
+    lucky = proxy_config.ProxyRecord(
         ok_count=1, streak_ok=1, streak_since=now, last_ok=now, latency=0.12,
     )
-    durable = proxy_config.ProxyRecord()
+    steady = proxy_config.note_health(
+        proxy_config.ProxyRecord(), ok=True, now=now - 1, latency=0.2,
+    )
+    steady = proxy_config.note_health(steady, ok=True, now=now, latency=0.2)
+    slower = proxy_config.ProxyRecord()
     for at in (10.0, 12.0, 10.0 + proxy_config.DURABLE_S):
-        durable = proxy_config.note_health(durable, ok=True, now=at, latency=0.7)
-    assert proxy_config.health_label(durable, 10.0 + proxy_config.DURABLE_S) == "durable"
-    assert proxy_config.selection_key(quick, now) < proxy_config.selection_key(durable, now)
+        slower = proxy_config.note_health(slower, ok=True, now=at, latency=0.7)
+    assert proxy_config.is_proven(steady, now) is True
+    assert proxy_config.is_proven(lucky, now) is False
+    assert proxy_config.selection_key(steady, now) < proxy_config.selection_key(lucky, now)
+    assert proxy_config.selection_key(steady, now) < proxy_config.selection_key(slower, now)
     assert proxy_config.should_promote(0.7, 0.12) is True
+    assert proxy_config.should_promote(0.7, 0.12, candidate_proven=False) is False
     assert proxy_config.should_promote(0.20, 0.18) is False
     assert proxy_config.should_promote(None, 0.2) is True
     assert proxy_config.should_promote(0.2, None) is False
