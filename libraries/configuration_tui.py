@@ -37,7 +37,7 @@ FIELD_HELP = {
     "Share_Host_GPU": "Guest uses the host GPU (shared, not passthrough). False = software GPU.",
     "Network": '"user" (NAT), "none", or a host interface. Space cycles the choices.',
     "Proxy": 'False, True (the proxies file, one URL per line), or a socks4://, socks5://, or http:// URL.',
-    "Proxy_Kill_Switch": "Cut the guest's internet when the proxy drops. Off switches as soon as this proxy stops answering.",
+    "Proxy_Kill_Switch": "Cut the guest's internet when the proxy drops. Off tries 10 proxies at a time until one works.",
     "Shared": "False, True (this directory), or an absolute host path shared via virtiofs.",
     "Clipboard": "Share the clipboard between the host and the guest (SPICE vdagent).",
     "Secure_Shell": "Forward the guest SSH port to the host.",

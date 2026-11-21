@@ -8,8 +8,9 @@ what a lost proxy means:
   * True  -> cut that guest's internet as soon as the proxy stops answering.
              Do not fall through to the host's real route, and do not rotate.
   * False -> keep using a proxy. When the value named a file and the current
-             proxy stops answering, move to the next URL in the file at once.
-             A proxy that answers slowly is still answering, so it stays.
+             proxy stops answering, try proxies PARALLEL_ATTEMPTS at a time
+             until one accepts a tunnel, then keep that one. A proxy that
+             still answers is not replaced because another is faster.
 
 This module is pure: it reads a file only in load_plan(), and the failover
 decision takes a clock reading instead of sleeping. The network namespace that
@@ -24,11 +25,15 @@ from dataclasses import dataclass
 
 # How often the running gateway asks the current proxy if it is still up, and
 # how long that connect may take. A connect that finishes inside the window is
-# a live proxy no matter how slow it was. A refused connection fails at once
-# and, with a proxies file, the next URL is used immediately. The window is
-# long enough that one slow reply is not mistaken for a dead proxy.
+# a live proxy no matter how slow it was. A refused connection fails at once.
+# The window is long enough that one slow reply is not mistaken for a dead proxy.
 PROBE_EVERY_S = 1.0
 PROBE_TIMEOUT_S = 8.0
+
+# How many proxies from a proxies file are dialed together when the current one
+# is not known to work. The first tunnel that comes up is kept. The next group
+# is started only when the whole group is down.
+PARALLEL_ATTEMPTS = 10
 
 _OFF = {"", "false", "off", "none", "no", "0"}
 # True selects the proxies file. These spellings match the other bools.
@@ -216,6 +221,23 @@ def describe(plan: ProxyPlan, kill_switch: bool) -> str:
         where = first
     flag = "on" if kill_switch else "off"
     return f"Proxy: {where}. Kill switch: {flag}."
+
+
+def batch_indexes(count: int, start: int, size: int) -> list[list[int]]:
+    """Walk `count` entries once, from `start`, in groups of `size`.
+
+    The last group is shorter when the list does not divide evenly. Groups do
+    not overlap and the walk does not repeat an index.
+    """
+    if count < 1 or size < 1:
+        return []
+    groups: list[list[int]] = []
+    offset = 0
+    while offset < count:
+        group = min(size, count - offset)
+        groups.append([(start + offset + i) % count for i in range(group)])
+        offset += group
+    return groups
 
 
 def note_probe(

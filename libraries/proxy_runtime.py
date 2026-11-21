@@ -16,8 +16,9 @@ it off the host's real route.
 
 Proxy_Kill_Switch closes those tunnels and refuses new ones while the proxy is
 down, then lets them through again once the proxy answers. With the switch off
-and a proxies file, the parent moves one entry down the file as soon as that
-proxy stops answering. A connect that succeeds is kept, however slow it was.
+and a proxies file, a proxy that is not known to work is replaced by dialing
+10 at a time; the first tunnel that comes up is kept until that proxy stops
+answering. A later connection does not shop for a faster one.
 
 Host port forwards (SSH and Ports) are published back on the host: QEMU binds
 them inside the namespace, and a unix socket bridges the host listener to that
@@ -313,6 +314,7 @@ class ProxySession:
         self._fwd_path = ""
         self._lock = threading.Lock()
         self._state = HealthState(0, None, False)
+        self._pinned = False  # current index has accepted a real tunnel
         self._endpoints: tuple[ProxyEndpoint, ...] = ()
         self._stop = threading.Event()
         self._closed = False
@@ -541,50 +543,199 @@ class ProxySession:
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._dial_fail(f"bad dial request: {exc}")
             return
-        attempts = 0
-        while True:
-            with self._lock:
-                killed = self._state.killed
-                count = len(self._endpoints)
-                proxy = None if not count else self._endpoints[self._state.index % count]
-            if killed or proxy is None:
-                self._dial_fail("proxy kill switch: guest internet is off")
-                return
+        with self._lock:
+            killed = self._state.killed
+            endpoints = self._endpoints
+            index = 0 if not endpoints else self._state.index % len(endpoints)
+            pinned = self._pinned
+        if killed or not endpoints:
+            self._dial_fail("proxy kill switch: guest internet is off")
+            return
+        single = self.kill_switch or not self.plan.from_file or len(endpoints) < 2
+        if single or pinned:
+            proxy = endpoints[index]
             tunnel = None
             try:
                 tunnel = proxy_tunnel.open_tunnel(proxy, host, port)
-                with self._lock:
-                    if self._state.killed:
-                        self._dial_fail("proxy kill switch: guest internet is off")
-                        return
-                _send_fd(sock, tunnel.fileno(), b'{"ok":true}\n')
+                owned = tunnel
+                tunnel = None
+                self._hand_tunnel(sock, index, proxy, owned)
                 return
             except proxy_tunnel.ProxyDown as exc:
-                # The proxy itself died. Try the next URL in this same dial so
-                # the guest does not have to time out and reconnect. A slow
-                # tunnel, or a destination the proxy refused, is not ProxyDown
-                # and falls through to the handler below.
-                self._note_current(proxy, False)
-                attempts += 1
-                with self._lock:
-                    still_here = bool(self._endpoints) and (
-                        self._endpoints[self._state.index % len(self._endpoints)] == proxy
-                    )
-                    killed_now = self._state.killed
-                if killed_now or still_here or attempts >= max(count, 1):
+                if single:
+                    self._note_current(proxy, False)
                     self._dial_fail(str(exc))
                     return
+                with self._lock:
+                    self._pinned = False
+                down = exc
             except OSError as exc:
+                # The proxy answered and rejected this destination. Another
+                # proxy is not asked; the destination is what failed.
                 self._dial_fail(str(exc))
                 return
             finally:
-                # sendmsg duplicated the fd into the namespace. Drop our copy
-                # either way; the supervisor owns the one the guest is spliced to.
                 if tunnel is not None:
                     try:
                         tunnel.close()
                     except OSError:
                         pass
+            self._search_dial(sock, endpoints, (index + 1) % len(endpoints), host, port, str(down))
+            return
+        self._search_dial(sock, endpoints, index, host, port, "proxy is not answering")
+
+    def _search_dial(
+        self,
+        sock: socket.socket,
+        endpoints: tuple,
+        start: int,
+        host: str,
+        port: int,
+        last_down: str,
+    ) -> None:
+        """Dial PARALLEL_ATTEMPTS proxies at once until a tunnel comes up.
+
+        A group that is entirely down is followed by the next group. A proxy
+        that answers and rejects the destination ends the search: that proxy
+        works, and the destination is what failed. One pass, no repeat.
+        """
+        count = len(endpoints)
+        refusal = None
+        for group in proxy_config.batch_indexes(count, start, proxy_config.PARALLEL_ATTEMPTS):
+            if self.killed:
+                self._dial_fail("proxy kill switch: guest internet is off")
+                return
+            batch = [(i, endpoints[i]) for i in group]
+            kind, payload = self._race_tunnels(batch, host, port)
+            if kind == "tunnel":
+                index, proxy, tunnel = payload
+                self._hand_tunnel(sock, index, proxy, tunnel)
+                return
+            if kind == "refusal":
+                refusal = payload
+                break
+            last_down = payload or last_down
+        if refusal is not None:
+            index, proxy, message = refusal
+            with self._lock:
+                if not self._state.killed:
+                    self._state = HealthState(index, None, False)
+                    self._pinned = True
+            self._dial_fail(message)
+            return
+        self._dial_fail(last_down)
+
+    def _race_tunnels(self, batch: list, host: str, port: int):
+        """Open `batch` together. First real tunnel wins; losers are closed."""
+        cancel = threading.Event()
+        found = threading.Event()
+        lock = threading.Lock()
+        tunnel = None
+        refusal = None
+        downs: list[str] = []
+        pending = len(batch)
+
+        def attempt(index: int, proxy: ProxyEndpoint) -> None:
+            nonlocal tunnel, refusal, pending
+            sock = None
+            try:
+                if cancel.is_set():
+                    return
+                try:
+                    sock = proxy_tunnel.open_tunnel(proxy, host, port)
+                except proxy_tunnel.ProxyDown as exc:
+                    with lock:
+                        downs.append(str(exc))
+                    return
+                except OSError as exc:
+                    with lock:
+                        if refusal is None:
+                            refusal = (index, proxy, str(exc))
+                    return
+                with lock:
+                    if cancel.is_set() or tunnel is not None:
+                        try:
+                            sock.close()
+                        except OSError:
+                            pass
+                        sock = None
+                        return
+                    tunnel = (index, proxy, sock)
+                    sock = None
+                cancel.set()
+                found.set()
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                with lock:
+                    pending -= 1
+                    if pending <= 0:
+                        found.set()
+
+        for index, proxy in batch:
+            threading.Thread(
+                target=attempt, args=(index, proxy), name="qvm-proxy-race", daemon=True,
+            ).start()
+        deadline = time.monotonic() + proxy_config.PROBE_TIMEOUT_S + 21.0
+        while not found.is_set() and time.monotonic() < deadline:
+            found.wait(0.05)
+        cancel.set()
+        with lock:
+            winner = tunnel
+            refused = refusal
+            down = downs[-1] if downs else "proxy is not answering"
+        if winner is not None:
+            return "tunnel", winner
+        if refused is not None:
+            return "refusal", refused
+        return "down", down
+
+    def _hand_tunnel(self, dial_sock: socket.socket, index: int, proxy: ProxyEndpoint, tunnel: socket.socket) -> bool:
+        """Pass `tunnel` to the namespace and remember `proxy` as the one in use."""
+        try:
+            with self._lock:
+                if self._state.killed:
+                    self._dial_fail("proxy kill switch: guest internet is off")
+                    return False
+                changed = self._state.index != index or not self._pinned
+                self._state = HealthState(index, None, False)
+                self._pinned = True
+            if changed:
+                print(f"Proxy using {proxy.render()}.", file=sys.stderr)
+            _send_fd(dial_sock, tunnel.fileno(), b'{"ok":true}\n')
+            return True
+        finally:
+            # sendmsg duplicated the fd. Drop our copy; the namespace owns the
+            # one the guest is spliced to.
+            try:
+                tunnel.close()
+            except OSError:
+                pass
+
+    def _first_reachable(self, batch: list, timeout: float) -> "int | None":
+        """Index of the first proxy in `batch` that accepts a TCP handshake."""
+        cancel = threading.Event()
+        found = threading.Event()
+        winner: list[int] = []
+
+        def attempt(index: int, proxy: ProxyEndpoint) -> None:
+            if cancel.is_set():
+                return
+            if proxy_tunnel.proxy_reachable(proxy, timeout):
+                winner.append(index)
+                cancel.set()
+                found.set()
+
+        for index, proxy in batch:
+            threading.Thread(
+                target=attempt, args=(index, proxy), name="qvm-proxy-probe", daemon=True,
+            ).start()
+        found.wait(timeout)
+        cancel.set()
+        return winner[0] if winner else None
 
     def _dial_fail(self, message: str) -> None:
         if self._dial is None:
@@ -612,12 +763,54 @@ class ProxySession:
             endpoints = self._refresh_endpoints()
             if endpoints:
                 with self._lock:
-                    proxy = endpoints[self._state.index % len(endpoints)]
+                    index = self._state.index % len(endpoints)
+                    proxy = endpoints[index]
                 ok = proxy_tunnel.proxy_reachable(proxy, proxy_config.PROBE_TIMEOUT_S)
-                self._note_current(proxy, ok)
+                self._on_probe(endpoints, index, proxy, ok)
             wait = proxy_config.PROBE_EVERY_S - (time.monotonic() - started)
             if self._stop.wait(max(0.0, wait)):
                 return
+
+    def _on_probe(self, endpoints: tuple, index: int, proxy: ProxyEndpoint, ok: bool) -> None:
+        """Stay on a proxy that answers. When it does not, search a group of 10."""
+        with self._lock:
+            if not self._endpoints or self._endpoints[self._state.index % len(self._endpoints)] != proxy:
+                return
+        if ok:
+            self._note_current(proxy, True)
+            return
+        rotate = (
+            not self.kill_switch and self.plan.from_file and len(endpoints) > 1
+        )
+        if not rotate:
+            self._note_current(proxy, False)
+            return
+        with self._lock:
+            if self._endpoints[self._state.index % len(self._endpoints)] != proxy:
+                return
+            self._pinned = False
+        others = min(proxy_config.PARALLEL_ATTEMPTS, len(endpoints) - 1)
+        batch = [((index + 1 + i) % len(endpoints), endpoints[(index + 1 + i) % len(endpoints)])
+                 for i in range(others)]
+        winner = self._first_reachable(batch, proxy_config.PROBE_TIMEOUT_S)
+        with self._lock:
+            if self._pinned:
+                return
+            if not self._endpoints or self._endpoints[self._state.index % len(self._endpoints)] != proxy:
+                return
+            if winner is None:
+                # This group is down. The next probe starts after it. When the
+                # group was the whole rest of the list, stay and try again.
+                advance = (index + 1 + others) % len(endpoints)
+                if advance == index:
+                    return
+                self._state = HealthState(advance, self._state.down_since, False)
+                return
+            self._state = HealthState(winner, None, False)
+        print(
+            f"Proxy stopped answering -- switching to {endpoints[winner].render()}.",
+            file=sys.stderr,
+        )
 
     def _note_current(self, proxy: ProxyEndpoint, ok: bool) -> None:
         """Record one result for `proxy`, but only if it is still current.

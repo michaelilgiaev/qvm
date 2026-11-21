@@ -186,6 +186,13 @@ def test_note_probe_kill_switch_cuts_immediately_and_does_not_rotate():
     assert action == "restore" and not state.killed and state.down_since is None
 
 
+def test_batch_indexes_groups_without_repeating():
+    assert proxy_config.PARALLEL_ATTEMPTS == 10
+    assert proxy_config.batch_indexes(15, 0, 10) == [list(range(10)), list(range(10, 15))]
+    assert proxy_config.batch_indexes(3, 1, 10) == [[1, 2, 0]]
+    assert proxy_config.batch_indexes(0, 0, 10) == []
+
+
 def test_note_probe_switches_on_the_first_failure_and_keeps_a_success():
     alive, action = _probe(HealthState(0, None, False), ok=True, now=50)
     assert action == "none" and alive.index == 0 and alive.down_since is None
@@ -807,12 +814,13 @@ def test_failover_moves_to_the_next_proxy_in_the_file(tmp_path, monkeypatch):
         )
         session = _boot(tmp_path, first, kill=False, source="proxies")
         assert _guest(session, tmp_path, _PING) == b"pong"
-        assert ("203.0.113.10", 80) in first.seen
-        first.stop()
-        _wait(lambda: session.index == 1, 5, "did not fail over to the next proxy")
+        winner = session.index
+        (first, second)[winner].stop()
+        other = (first, second)[1 - winner]
+        _wait(lambda: session.index != winner, 5, "did not fail over to the other proxy")
         assert session.killed is False
         assert _guest(session, tmp_path, _PING) == b"pong"
-        assert ("203.0.113.10", 80) in second.seen
+        assert ("203.0.113.10", 80) in other.seen
     finally:
         if session is not None:
             session.close()
@@ -849,34 +857,66 @@ def test_a_dead_proxy_fails_over_inside_the_dial(tmp_path, monkeypatch):
         second.close()
 
 
-def test_a_slow_proxy_is_not_switched(tmp_path, monkeypatch):
-    monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 0.3)
+def test_search_uses_the_first_working_tunnel_and_then_keeps_it(tmp_path, monkeypatch):
+    """Ten-wide (here, both) attempts run together. A later dial keeps the winner
+    instead of racing again, so a slow neighbour is not dialed the second time."""
+    monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 30)
     monkeypatch.setattr(proxy_config, "PROBE_TIMEOUT_S", 2.0)
-    proxy = _Proxy("socks5", accept_delay=0.4)
-    backup = _Proxy("http")
+    slow = _Proxy("socks5", accept_delay=0.8)
+    fast = _Proxy("http")
     session = None
     try:
-        one = proxy.start()
-        two = backup.start()
+        one = slow.start()
+        two = fast.start()
         (tmp_path / "proxies").write_text(
             f"socks5://127.0.0.1:{one}\nhttp://127.0.0.1:{two}\n",
             encoding="utf-8",
         )
-        session = _boot(tmp_path, proxy, kill=False, source="proxies")
+        session = _boot(tmp_path, slow, kill=False, source="proxies")
+        started = time.monotonic()
         assert _guest(session, tmp_path, _PING) == b"pong"
-        time.sleep(1.2)
-        assert session.index == 0
-        assert session.killed is False
-        assert ("203.0.113.10", 80) in proxy.seen
-        assert backup.seen == []
+        assert time.monotonic() - started < 0.5
+        assert session.index == 1
+        time.sleep(1.0)
+        slow_seen = len(slow.seen)
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        assert session.index == 1
+        assert len(slow.seen) == slow_seen
+        assert ("203.0.113.10", 80) in fast.seen
     finally:
         if session is not None:
             session.close()
-        proxy.close()
-        backup.close()
+        slow.close()
+        fast.close()
 
 
-def test_a_destination_refusal_does_not_switch_proxy(tmp_path, monkeypatch):
+def test_a_dead_group_is_followed_by_the_next_group(tmp_path, monkeypatch):
+    monkeypatch.setattr(proxy_config, "PARALLEL_ATTEMPTS", 2)
+    monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 30)
+    monkeypatch.setattr(proxy_config, "PROBE_TIMEOUT_S", 2.0)
+    live = _Proxy("http")
+    session = None
+    try:
+        port = live.start()
+        dead_a = _free_port()
+        dead_b = _free_port()
+        (tmp_path / "proxies").write_text(
+            f"socks5://127.0.0.1:{dead_a}\n"
+            f"socks5://127.0.0.1:{dead_b}\n"
+            f"http://127.0.0.1:{port}\n",
+            encoding="utf-8",
+        )
+        session = _boot(tmp_path, live, kill=False, source="proxies")
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        assert session.index == 2
+        assert ("203.0.113.10", 80) in live.seen
+    finally:
+        if session is not None:
+            session.close()
+        live.close()
+
+
+def test_a_destination_refusal_does_not_block_the_rest_of_the_group(tmp_path, monkeypatch):
     monkeypatch.setattr(proxy_config, "PROBE_EVERY_S", 30)
     first = _Proxy("socks5", refuse=True)
     second = _Proxy("http")
@@ -889,10 +929,9 @@ def test_a_destination_refusal_does_not_switch_proxy(tmp_path, monkeypatch):
             encoding="utf-8",
         )
         session = _boot(tmp_path, first, kill=False, source="proxies")
-        assert _guest(session, tmp_path, _PING) != b"pong"
-        assert session.index == 0
-        assert ("203.0.113.10", 80) in first.seen
-        assert second.seen == []
+        assert _guest(session, tmp_path, _PING) == b"pong"
+        assert session.index == 1
+        assert ("203.0.113.10", 80) in second.seen
     finally:
         if session is not None:
             session.close()
