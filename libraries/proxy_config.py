@@ -34,13 +34,15 @@ from dataclasses import dataclass
 # how long that connect may take. A connect that finishes inside the window is
 # a live proxy no matter how slow it was. A refused connection fails at once.
 # The window is long enough that one slow reply is not mistaken for a dead proxy.
-PROBE_EVERY_S = 0.4
+# How soon the background tester starts another wave. The guest dial does not
+# wait on this. Tests raise it when they need the background quiet.
+PROBE_EVERY_S = 0.05
 PROBE_TIMEOUT_S = 1.2
 
 # A guest dial does not get the canary's patience. One proxy has this long to
 # finish the tunnel and to send the first byte. After that it is abandoned and
 # the next proxies are tried together.
-GUEST_DIAL_TIMEOUT_S = 0.6
+GUEST_DIAL_TIMEOUT_S = 0.45
 
 # The running VM writes this beside hypervisor.cfg. `qvm --configure` reads it.
 # `proxy.cmd` is how that screen asks the running VM to switch now.
@@ -75,6 +77,13 @@ def note_health(
     """Fold one check into `record`. A failure ends the current uptime streak."""
     if ok:
         since = record.streak_since if record.streak_ok else now
+        if latency is None:
+            blended = record.latency
+        elif record.latency is None:
+            blended = latency
+        else:
+            # One slow probe must not make a fast proxy look slow.
+            blended = record.latency * 0.75 + latency * 0.25
         return ProxyRecord(
             ok_count=record.ok_count + 1,
             fail_count=record.fail_count,
@@ -83,7 +92,7 @@ def note_health(
             streak_since=since,
             last_ok=now,
             last_fail=record.last_fail,
-            latency=record.latency if latency is None else latency,
+            latency=blended,
         )
     return ProxyRecord(
         ok_count=record.ok_count,
@@ -150,13 +159,21 @@ def should_promote(current_s: "float | None", candidate_s: "float | None") -> bo
         return False
     if current_s is None:
         return True
-    return candidate_s + 0.05 < current_s
+    # A small edge is not worth moving a guest that already has a stream.
+    # The replacement has to be clearly faster.
+    return candidate_s + 0.1 < current_s * 0.8
 
 # How many proxies from a proxies file are proved together when none is pinned.
 # The whole group is started before one is chosen. The first proxy that
 # forwards real bytes is kept. The next group starts only when nobody in this
 # group forwarded. A completed handshake is not a win.
 PARALLEL_ATTEMPTS = 10
+
+# How many proxy checks stay in flight while the VM is running. The guest's
+# own dial still uses PARALLEL_ATTEMPTS. This is the background bench: it
+# keeps walking the file and rechecking saved proxies without a pause between
+# waves, so a replacement is already proven when the one in use dies.
+BACKGROUND_WIDTH = 30
 
 # A proxy is up when two TLS tunnels to this host both verify the real
 # certificate and come back with a real reply at the same time. Cleartext

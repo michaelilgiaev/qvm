@@ -398,6 +398,9 @@ class ProxySession:
         self._ledger: dict[tuple, ProxyRecord] = {}
         self._recheck_at = 0
         self._pool_cursor = 0
+        # Proxy keys with a background check running. The dial thread never
+        # waits on these.
+        self._inflight: set = set()
         self._note = ""
         self._finding = False
         self._find_cv = threading.Condition()
@@ -928,6 +931,11 @@ class ProxySession:
         # slow handshake is what made a dead batch feel stuck.
         deadline = time.monotonic() + timeout + 0.25
         while not found.is_set() and time.monotonic() < deadline:
+            with self._lock:
+                # The background bench may already have pinned a working proxy
+                # while this cold group is still timing out.
+                if self._pinned and self._endpoints:
+                    return self._state.index % len(self._endpoints)
             if threads and all(not thread.is_alive() for thread in threads):
                 break
             found.wait(0.02)
@@ -1340,13 +1348,11 @@ class ProxySession:
         if not pinned:
             self._await_working(index)
             return
-        # Open guest sockets are not a heartbeat. A tunnel can sit there
-        # forever while the proxy sends nothing. Probe anyway, and when the
-        # guest is mid-connection demand a fast answer.
-        if self._guest_sockets():
-            timeout = proxy_config.GUEST_DIAL_TIMEOUT_S
-        else:
-            timeout = proxy_config.PROBE_TIMEOUT_S
+        # A short budget here drops a proxy the guest is using just because
+        # the check was slow, which opens a gap. Refusals still fail at once.
+        # A tunnel that accepts and then says nothing is closed by the stall
+        # watch, and the background bench already has the replacement.
+        timeout = proxy_config.PROBE_TIMEOUT_S
         started = time.monotonic()
         info = proxy_tunnel.probe_details(proxy, timeout)
         latency = time.monotonic() - started
@@ -1376,12 +1382,12 @@ class ProxySession:
         self._await_working(nxt)
 
     def _pool_loop(self) -> None:
-        """Measure the rest of the proxy list without touching the guest dial.
+        """Keep proving proxies for the whole time the VM is up.
 
-        Each pass proves up to PARALLEL_ATTEMPTS proxies in parallel: saved
-        ones first, then the next unread part of the file. A clearly faster
-        result replaces the proxy in use. The dial thread does not wait for
-        this work.
+        Up to BACKGROUND_WIDTH checks run at once. Finished slots are filled
+        immediately from the saved list and then from the next part of the
+        file. The guest dial never joins these threads. A clearly faster
+        result takes over as soon as it is measured.
         """
         while not self._stop.is_set():
             if self._stop.wait(proxy_config.PROBE_EVERY_S):
@@ -1389,12 +1395,15 @@ class ProxySession:
             if self.kill_switch or not self.plan.from_file:
                 continue
             try:
-                self._pool_once()
+                self._pool_launch()
+                self._promote_fastest()
             except Exception:
                 continue
 
-    def _pool_targets(self, endpoints: tuple) -> list:
-        """Saved proxies, then the next file window. The one in use is skipped."""
+    def _pool_targets(self, endpoints: tuple, room: int) -> list:
+        """Saved proxies, then the next file window, skipping checks in flight."""
+        if room < 1:
+            return []
         with self._lock:
             if not endpoints or not self._pinned:
                 current_key = None
@@ -1402,8 +1411,10 @@ class ProxySession:
                 current_key = self._proxy_key(endpoints[self._state.index % len(endpoints)])
             saved = [key for _lat, key in self._working if key != current_key]
             by_key = {self._proxy_key(ep): ep for ep in endpoints}
+            inflight = set(self._inflight)
+            cursor = self._pool_cursor
         chosen: list = []
-        seen: set = set()
+        seen: set = set(inflight)
         if current_key is not None:
             seen.add(current_key)
         for key in saved:
@@ -1412,12 +1423,13 @@ class ProxySession:
                 continue
             seen.add(key)
             chosen.append(proxy)
-            if len(chosen) >= proxy_config.PARALLEL_ATTEMPTS:
+            if len(chosen) >= room:
                 return chosen
         count = len(endpoints)
         if count < 1:
             return chosen
-        start = self._pool_cursor % count
+        start = cursor % count
+        cold = 0
         for offset in range(count):
             proxy = endpoints[(start + offset) % count]
             key = self._proxy_key(proxy)
@@ -1425,45 +1437,47 @@ class ProxySession:
                 continue
             seen.add(key)
             chosen.append(proxy)
-            if len(chosen) >= proxy_config.PARALLEL_ATTEMPTS:
+            cold += 1
+            if len(chosen) >= room:
                 break
-        self._pool_cursor = (start + max(1, len(chosen))) % count
+        self._pool_cursor = (start + max(1, cold)) % count
         return chosen
 
-    def _pool_once(self) -> None:
+    def _pool_launch(self) -> None:
         endpoints = tuple(self._refresh_endpoints())
         if len(endpoints) < 2:
             return
-        targets = self._pool_targets(endpoints)
-        if not targets:
-            return
-        threads = []
-
-        def check(proxy: ProxyEndpoint) -> None:
-            started = time.monotonic()
-            try:
-                info = proxy_tunnel.probe_details(proxy, proxy_config.PROBE_TIMEOUT_S)
-            except Exception:
-                info = None
-            if info is not None:
-                self._remember_working(proxy, time.monotonic() - started, info)
-                return
-            self._record_failure(proxy)
-            self._forget_working(proxy)
-
+        with self._lock:
+            room = proxy_config.BACKGROUND_WIDTH - len(self._inflight)
+        targets = self._pool_targets(endpoints, room)
         for proxy in targets:
-            thread = threading.Thread(
-                target=check, args=(proxy,), name="qvm-proxy-pool", daemon=True,
-            )
-            thread.start()
-            threads.append(thread)
-        deadline = time.monotonic() + proxy_config.PROBE_TIMEOUT_S + 0.5
-        for thread in threads:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            thread.join(remaining)
-        self._promote_fastest()
+            key = self._proxy_key(proxy)
+            with self._lock:
+                if key in self._inflight:
+                    continue
+                self._inflight.add(key)
+
+            def check(proxy: ProxyEndpoint = proxy, key: tuple = key) -> None:
+                try:
+                    started = time.monotonic()
+                    try:
+                        info = proxy_tunnel.probe_details(
+                            proxy, proxy_config.PROBE_TIMEOUT_S,
+                        )
+                    except Exception:
+                        info = None
+                    if info is not None:
+                        self._remember_working(proxy, time.monotonic() - started, info)
+                        return
+                    self._record_failure(proxy)
+                    self._forget_working(proxy)
+                finally:
+                    with self._lock:
+                        self._inflight.discard(key)
+
+            threading.Thread(
+                target=check, name="qvm-proxy-pool", daemon=True,
+            ).start()
 
     def _promote_fastest(self) -> None:
         """Move the guest onto a saved proxy that measured clearly faster."""
@@ -1471,31 +1485,36 @@ class ProxySession:
             return
         with self._lock:
             endpoints = tuple(self._endpoints)
-            if not endpoints or not self._pinned or len(endpoints) < 2:
+            if not endpoints or len(endpoints) < 2:
                 return
-            index = self._state.index % len(endpoints)
-            current_key = self._proxy_key(endpoints[index])
-            current_latency = next(
-                (lat for lat, key in self._working if key == current_key), None,
-            )
+            pinned = self._pinned
+            index = self._state.index % len(endpoints) if pinned else None
             gen = self._pin_gen
+            current_latency = None
+            if index is not None:
+                current_key = self._proxy_key(endpoints[index])
+                current_latency = next(
+                    (lat for lat, key in self._working if key == current_key), None,
+                )
         standby = self._take_standby()
         if standby is None:
             return
         nxt, proxy = standby
-        if nxt == index:
+        if index is not None and nxt == index:
             return
         key = self._proxy_key(proxy)
         with self._lock:
-            if self._pin_gen != gen or not self._pinned:
+            if self._pin_gen != gen:
+                return
+            if pinned and not self._pinned:
                 return
             candidate = next((lat for lat, item in self._working if item == key), None)
-        if not proxy_config.should_promote(current_latency, candidate):
+        if pinned and not proxy_config.should_promote(current_latency, candidate):
             return
         self._pin_forwarding(nxt, proxy)
         self._note = f"Faster proxy {proxy.render()}."
-        self._ctrl_rpc({"op": "drop"})
-        self._ctrl_rpc({"op": "allow"})
+        # Leave sockets that are already carrying bytes alone. New dials use
+        # the faster proxy. Cutting them here is what dropped a live stream.
         milliseconds = 0 if candidate is None else int(round(candidate * 1000))
         print(
             f"Proxy using {proxy.render()} ({milliseconds} ms).",
